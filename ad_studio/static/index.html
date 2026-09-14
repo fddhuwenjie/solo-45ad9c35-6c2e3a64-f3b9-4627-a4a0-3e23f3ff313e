@@ -79,6 +79,16 @@
     <h2>描述卡</h2>
     <div id="descList"></div>
 
+    <h2>旁白拼接 <span class="muted small">挂接多版录音 → 单击波形设锚点 → 拖选区「加入拼接轨」→ 交叉淡化 → A/B/C 试听 → 确认</span></h2>
+    <div class="sp-settings">
+      <label>描述卡 <select id="spliceDesc"></select></label>
+      <label>零交叉容差 <input type="number" id="spZerox" step="0.5" value="2"> ms</label>
+      <label>静音缺口≥ <input type="number" id="spGap" step="0.01" value="0.05"> s</label>
+      <label>接缝峰值上限 <input type="number" id="spCeil" step="0.5" value="-1"> dBFS</label>
+      <span id="spStatus" class="muted small"></span>
+    </div>
+    <div id="spliceEditor"></div>
+
     <h2>响度配平 <span id="lvHint" class="muted small">框选有效语音 → 拖增益/套建议 → A/B 循环试听 → 确认</span></h2>
     <div class="lv-settings">
       <label>目标电平 <input type="number" id="lvTarget" step="0.5" value="-20"> dBFS</label>

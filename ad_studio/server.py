@@ -58,6 +58,9 @@ def init_db():
     CREATE TABLE IF NOT EXISTS leveling(
         project_id INTEGER PRIMARY KEY,
         data_json TEXT NOT NULL);      -- {settings, items:{descId:{ranges,gain,...}}}
+    CREATE TABLE IF NOT EXISTS splice(
+        project_id INTEGER PRIMARY KEY,
+        data_json TEXT NOT NULL);      -- {settings, items:{descId:{takes,anchors,segments,status}}}
     """)
     conn.commit()
     conn.close()
@@ -610,6 +613,386 @@ def sanitize_leveling_plan(plan, report):
         safe["items"][did] = it
     return safe
 
+# ---------------------------------------------------------------- 旁白多版本拼接
+
+SPLICE_DEFAULTS = {"zeroxMs": 2.0,        # 切点距零交叉容差(ms, 硬切边)
+                   "gapWarnS": 0.05,      # 静音缺口告警阈值(s)
+                   "seamCeilingDb": -1.0} # 接缝峰值上限(dBFS)
+
+def zero_cross_dist_ms(samples, nch, fr, t, win_ms=12.0):
+    """切点 t(秒)距最近过零点的距离(ms), 取第一声道。无过零返回窗宽。"""
+    n = len(samples) // nch
+    if n < 2:
+        return 0.0
+    c0 = max(1, min(n - 1, int(round(t * fr))))
+    w = max(1, int(win_ms / 1000.0 * fr))
+    best = None
+    for i in range(max(1, c0 - w), min(n, c0 + w)):
+        a = samples[(i - 1) * nch]; b = samples[i * nch]
+        if (a < 0) != (b < 0):
+            d = abs(i - c0)
+            if best is None or d < best:
+                best = d
+    return (best / fr * 1000.0) if best is not None else float(win_ms)
+
+def render_splice(segments, narr_clips, nch, fr):
+    """
+    按拼接段合成旁白 PCM(线性交叉淡化, 与前端 buildSpliceBuffer 同算法)。
+    segments: [{take_id,in,out,xfade,gap}]  xfade/gap 相对前一段(秒)。
+    缺失/越界段跳过(由 splice_report 负责报错)。
+    返回 (samples, duration, layout, seams, clip_frames):
+    layout: [{seg,take_id,in,out,xfade,gap,comp_start,comp_end}](秒, 仅有效段)
+    seams:   [{seg,t,xfade,peak_db,clip_frames,clip_t}]  seg 为后一段序号
+    """
+    valid = []
+    for idx, sg in enumerate(segments or []):
+        clip = narr_clips.get(str(sg.get("take_id")))
+        if not clip:
+            continue
+        s, c, f = clip
+        s = convert(s, c, f, nch, fr)
+        total = len(s) // nch
+        f0 = max(0, min(total, int(round(float(sg.get("in", 0.0)) * fr))))
+        f1 = max(f0, min(total, int(round(float(sg.get("out", 0.0)) * fr))))
+        if f1 <= f0:
+            continue
+        valid.append({"seg": idx, "take_id": sg.get("take_id"),
+                      "in": float(sg.get("in", 0.0)), "out": float(sg.get("out", 0.0)),
+                      "pcm": s[f0 * nch:f1 * nch], "frames": f1 - f0,
+                      "xfade": max(0.0, float(sg.get("xfade") or 0.0)),
+                      "gap": max(0.0, float(sg.get("gap") or 0.0))})
+    # 布局(帧): 段 i 起点 = 前段终点 - xfade + gap
+    pos = 0
+    for k, v in enumerate(valid):
+        start = 0 if k == 0 else pos - int(round(v["xfade"] * fr)) + int(round(v["gap"] * fr))
+        v["start_f"] = max(0, start)
+        pos = v["start_f"] + v["frames"]
+    total = pos
+    comp = array("f", [0.0]) * (total * nch)
+    # 加权累加: 头部 xfade 线性淡入, 尾部(下一段 xfade)线性淡出, 重叠区权重和为 1
+    for k, v in enumerate(valid):
+        xf_in = int(round(v["xfade"] * fr)) if k > 0 else 0
+        xf_out = int(round(valid[k + 1]["xfade"] * fr)) if k + 1 < len(valid) else 0
+        pcm = v["pcm"]; nf = v["frames"]; s0 = v["start_f"]
+        for j in range(nf):
+            w = 1.0
+            if xf_in > 0 and j < xf_in:
+                w = j / xf_in
+            if xf_out > 0:
+                tail = nf - j
+                if tail <= xf_out:
+                    tw = tail / xf_out
+                    if tw < w:
+                        w = tw
+            base = (s0 + j) * nch; jb = j * nch
+            for c in range(nch):
+                comp[base + c] += pcm[jb + c] * w
+    out = array("h")
+    clip_frames = 0
+    for i in range(total):
+        clipped = False
+        base = i * nch
+        for c in range(nch):
+            v = comp[base + c]
+            if v > 32767 or v < -32768:
+                clipped = True
+                v = 32767 if v > 32767 else -32768
+            out.append(int(v))
+        if clipped:
+            clip_frames += 1
+    seams = []
+    for k in range(1, len(valid)):
+        v = valid[k]
+        s0 = v["start_f"]
+        xf_f = int(round(v["xfade"] * fr))
+        if xf_f > 0:
+            w0, w1 = s0, min(total, s0 + xf_f)
+        else:
+            half = int(0.005 * fr)
+            w0, w1 = max(0, s0 - half), min(total, s0 + half)
+        mx = 0.0; nclip = 0; first = None
+        for i in range(w0, w1):
+            base = i * nch; m2 = 0.0; cl = False
+            for c in range(nch):
+                x = comp[base + c]
+                if abs(x) > m2: m2 = abs(x)
+                if x > 32767 or x < -32768: cl = True
+            if cl:
+                nclip += 1
+                if first is None: first = i
+            if m2 > mx: mx = m2
+        seams.append({"seg": v["seg"], "t": round(s0 / fr, 4), "xfade": v["xfade"],
+                      "peak_db": round(dbfs(max(mx, 1e-6) / 32768.0), 2),
+                      "clip_frames": nclip,
+                      "clip_t": round((first if first is not None else s0) / fr, 4)})
+    layout = [{"seg": v["seg"], "take_id": v["take_id"], "in": v["in"], "out": v["out"],
+               "xfade": v["xfade"], "gap": v["gap"],
+               "comp_start": round(v["start_f"] / fr, 4),
+               "comp_end": round((v["start_f"] + v["frames"]) / fr, 4)} for v in valid]
+    return out, (total / fr if fr else 0.0), layout, seams, clip_frames
+
+def splice_report(st, plans, src_nch, src_fr, src_dur, narr_clips):
+    """
+    拼接方案校审(纯计算, 不写库): 采样格式/片段重叠/零交叉距离/接缝峰值/
+    静音缺口/成片时长, 以及锚点倒序、来源缺失、接缝削波、合成后压住对白/关键声。
+    bad 级错误使方案保持待处理(时码定位到成片)。返回 {settings, items, order, blocked}。
+    """
+    settings = dict(SPLICE_DEFAULTS)
+    settings.update((plans or {}).get("settings") or {})
+    items = {}
+    placements = st["placements"].get("placements", {})
+    desc_by_id = {d["id"]: d for d in st["descriptions"]}
+    narr_name = {str(n["id"]): n.get("name", str(n["id"])) for n in st["narrations"]}
+    for did, plan in ((plans or {}).get("items") or {}).items():
+        errors = []
+        segments = plan.get("segments") or []
+        anchors = plan.get("anchors") or {}
+        p = placements.get(did) or {}
+        start = float(p.get("start", (desc_by_id.get(did) or {}).get("start", 0) or 0))
+        # 1) 来源缺失 / 采样格式 / 切点范围
+        valid = []
+        for idx, sg in enumerate(segments):
+            tid = str(sg.get("take_id"))
+            clip = narr_clips.get(tid)
+            nm = narr_name.get(tid, tid)
+            if clip is None:
+                errors.append({"code": "missing", "sev": "bad", "msg":
+                    "来源缺失:第%d段引用的旁白录音 %s 已不存在,请重新挂接" % (idx + 1, nm)})
+                continue
+            if src_nch is None or (clip[1], clip[2]) != (src_nch, src_fr):
+                errors.append({"code": "format", "sev": "bad", "msg":
+                    "采样格式不一致:第%d段「%s」为 %dch/%dHz,工程为 %dch/%dHz,无法可靠拼接" % (
+                        idx + 1, nm, clip[1], clip[2], src_nch or 0, src_fr or 0)})
+                continue
+            dur = (len(clip[0]) // clip[1]) / clip[2]
+            i0 = float(sg.get("in", 0.0)); i1 = float(sg.get("out", 0.0))
+            if not (0.0 <= i0 < i1 <= dur + 1e-6):
+                errors.append({"code": "range", "sev": "bad", "msg":
+                    "切点越界:第%d段 [%s–%s] 超出「%s」时长 %s" % (
+                        idx + 1, fmt_tc(i0), fmt_tc(i1), nm, fmt_tc(dur))})
+                continue
+            valid.append((idx, sg, clip))
+        if not segments:
+            errors.append({"code": "empty", "sev": "bad", "msg":
+                "拼接轨为空:在候选录音波形上拖出选区,再「加入拼接轨」"})
+        # 2) 片段重叠: 交叉淡化越界 / 前后淡化之和超过中段(三重叠加)
+        durs = {idx: float(sg["out"]) - float(sg["in"]) for idx, sg, _ in valid}
+        xfs = {idx: max(0.0, float(sg.get("xfade") or 0.0)) for idx, sg, _ in valid}
+        for k in range(1, len(valid)):
+            idx = valid[k][0]; pidx = valid[k - 1][0]
+            if xfs[idx] > min(durs[pidx], durs[idx]) + 1e-6:
+                errors.append({"code": "overlap", "sev": "bad", "msg":
+                    "片段重叠:第%d段交叉淡化 %.3fs 超过相邻段时长(%.3fs/%.3fs)" % (
+                        idx + 1, xfs[idx], durs[pidx], durs[idx])})
+        for k in range(1, len(valid) - 1):
+            idx = valid[k][0]
+            s = xfs[idx] + xfs[valid[k + 1][0]]
+            if s > durs[idx] + 1e-6:
+                errors.append({"code": "overlap", "sev": "bad", "msg":
+                    "片段重叠:第%d段前后交叉淡化之和 %.3fs 超过本段时长 %.3fs,会出现三重叠加" % (
+                        idx + 1, s, durs[idx])})
+        # 3) 合成(存在 bad 时先修来源/格式/重叠, 不合成)
+        comp_dur = 0.0; layout = []; seams = []
+        if valid and not any(e["sev"] == "bad" for e in errors):
+            _sm, comp_dur, layout, seams, _cf = render_splice(
+                segments, narr_clips, src_nch, src_fr)
+        lay_by_seg = {l["seg"]: l for l in layout}
+        # 4) 零交叉距离(仅内部接缝的硬切边, 有淡化保护的边不报)
+        zerox = []
+        for k in range(1, len(valid)):
+            idx, sg, clip = valid[k]
+            pidx, psg, pclip = valid[k - 1]
+            if xfs[idx] >= 0.005:
+                continue
+            for label, c, t in (("第%d段出点" % (pidx + 1), pclip, float(psg["out"])),
+                                ("第%d段入点" % (idx + 1), clip, float(sg["in"]))):
+                d = zero_cross_dist_ms(c[0], c[1], c[2], t)
+                zerox.append({"seg": idx, "label": label, "t": round(t, 4),
+                              "dist_ms": round(d, 2)})
+        if zerox:
+            worst = max(zerox, key=lambda z: z["dist_ms"])
+            if worst["dist_ms"] > float(settings["zeroxMs"]):
+                errors.append({"code": "zerox", "sev": "warn", "msg":
+                    "零交叉距离:%s %s 距最近过零 %.1fms(容差 %.1fms),硬切可能爆音,建议微调切点或加交叉淡化" % (
+                        worst["label"], fmt_tc(worst["t"]), worst["dist_ms"],
+                        float(settings["zeroxMs"]))})
+        # 5) 静音缺口
+        for l in layout:
+            if l["gap"] > float(settings["gapWarnS"]):
+                errors.append({"code": "gap", "sev": "warn", "msg":
+                    "静音缺口:第%d段前留有 %.3fs 静音(成片时码 %s),听感会断气" % (
+                        l["seg"] + 1, l["gap"], fmt_tc(start + l["comp_start"]))})
+        # 6) 接缝峰值 / 接缝削波
+        for si, sm in enumerate(seams):
+            at = fmt_tc(start + sm["t"])
+            if sm["clip_frames"] > 0:
+                errors.append({"code": "seamclip", "sev": "bad", "msg":
+                    "接缝削波:接缝%d(%s)%d 个采样越界,首次 %s,请缩短交叉淡化或移开切点" % (
+                        si + 1, at, sm["clip_frames"], fmt_tc(start + sm["clip_t"]))})
+            elif sm["peak_db"] > float(settings["seamCeilingDb"]):
+                errors.append({"code": "seampeak", "sev": "warn", "msg":
+                    "接缝峰值:接缝%d(%s)峰值 %.1f dBFS 超过上限 %.1f dBFS" % (
+                        si + 1, at, sm["peak_db"], float(settings["seamCeilingDb"]))})
+        # 7) 锚点倒序(同步锚点在成片时间轴上必须递增)
+        anchor_pts = []
+        for idx, sg, clip in valid:
+            tid = str(sg.get("take_id"))
+            if tid not in anchors:
+                continue
+            a = float(anchors[tid])
+            lay = lay_by_seg.get(idx)
+            if lay is None:
+                continue
+            if not (float(sg["in"]) - 1e-6 <= a <= float(sg["out"]) + 1e-6):
+                errors.append({"code": "anchor", "sev": "warn", "msg":
+                    "锚点未落入选区:「%s」锚点 %s 不在第%d段选区 [%s–%s] 内,对齐参考失效" % (
+                        narr_name.get(tid, tid), fmt_tc(a), idx + 1,
+                        fmt_tc(float(sg["in"])), fmt_tc(float(sg["out"])))})
+                continue
+            anchor_pts.append({"seg": idx, "take_id": tid, "anchor": a,
+                               "comp_t": round(lay["comp_start"] + (a - float(sg["in"])), 4)})
+        for k in range(1, len(anchor_pts)):
+            if anchor_pts[k]["comp_t"] <= anchor_pts[k - 1]["comp_t"] + 1e-9:
+                errors.append({"code": "anchororder", "sev": "bad", "msg":
+                    "锚点倒序:第%d段锚点(成片 %s)不晚于第%d段(成片 %s),拼接段顺序可能有误" % (
+                        anchor_pts[k]["seg"] + 1, fmt_tc(start + anchor_pts[k]["comp_t"]),
+                        anchor_pts[k - 1]["seg"] + 1, fmt_tc(start + anchor_pts[k - 1]["comp_t"]))})
+        # 8) 合成后压住对白/关键声(按成片区间)
+        end = start + comp_dur
+        if comp_dur > 0:
+            for g in st["dialogue"]:
+                ov = max(0.0, min(end, g["end"]) - max(start, g["start"]))
+                if ov > 0.05:
+                    errors.append({"code": "dialogue",
+                        "sev": "warn" if p.get("duck") else "bad", "msg":
+                        "合成后压住对白:与「%s」交叠 %.2fs(%s–%s)%s" % (
+                            (g.get("text") or "")[:18], ov,
+                            fmt_tc(max(start, g["start"])), fmt_tc(min(end, g["end"])),
+                            ",已压低原声仍需确认清晰度" if p.get("duck") else "")})
+            for k2 in st["keysounds"]:
+                if k2.get("maskable") is False:
+                    ov = max(0.0, min(end, k2["end"]) - max(start, k2["start"]))
+                    if ov > 0.03:
+                        errors.append({"code": "keysound", "sev": "bad", "msg":
+                            "合成后压住关键声「%s」 %.2fs(%s–%s),情节线索将丢失" % (
+                                k2.get("label"), ov, fmt_tc(max(start, k2["start"])),
+                                fmt_tc(min(end, k2["end"])))})
+            # 9) 成片时长 vs 当前空档
+            nxt = min([g["start"] for g in st["dialogue"] if g["start"] >= start] or [src_dur])
+            if end > nxt + 0.05:
+                errors.append({"code": "duration", "sev": "warn", "msg":
+                    "成片时长:合成 %.2fs 超出当前空档(到 %s) %.2fs" % (
+                        comp_dur, fmt_tc(nxt), end - nxt)})
+        seg_out = []
+        for idx, sg, clip in valid:
+            lay = lay_by_seg.get(idx) or {}
+            seg_out.append({"seg": idx, "take_id": sg.get("take_id"),
+                            "name": narr_name.get(str(sg.get("take_id")), str(sg.get("take_id"))),
+                            "in": float(sg.get("in", 0.0)), "out": float(sg.get("out", 0.0)),
+                            "xfade": xfs[idx], "gap": max(0.0, float(sg.get("gap") or 0.0)),
+                            "comp_start": lay.get("comp_start"), "comp_end": lay.get("comp_end")})
+        items[did] = {"desc_id": did, "start": start, "duration": round(comp_dur, 3),
+                      "segments": seg_out, "seams": seams, "anchors": anchor_pts,
+                      "zerox": zerox,
+                      "sources": [{"take_id": t, "name": narr_name.get(t, t)}
+                                  for t in dict.fromkeys(str(sg.get("take_id"))
+                                                         for sg in segments)],
+                      "status": plan.get("status", "pending"),
+                      "acceptedReason": plan.get("accepted_reason", ""),
+                      "errors": errors}
+    order = sorted(items.keys(), key=lambda d: items[d]["start"])
+    blocked = [d for d in order if any(e["sev"] == "bad" for e in items[d]["errors"])]
+    return {"settings": settings, "items": items, "order": order, "blocked": blocked}
+
+def sanitize_splice(plans, report):
+    """
+    按实时校审纠正拼接方案状态(纵深防御, 不相信库里的 confirmed 标记):
+    存在 bad 阻塞(锚点倒序/来源缺失/接缝削波/压住对白关键声/格式不一致等)或
+    无报告的方案强制 pending; 仅无阻塞且 status=confirmed 的方案保留 confirmed,
+    其合成结果才会进入配平/混音/脚本/复演。
+    """
+    safe = {"settings": (plans or {}).get("settings") or dict(SPLICE_DEFAULTS), "items": {}}
+    for did, plan in ((plans or {}).get("items") or {}).items():
+        p2 = dict(plan)
+        r = (report.get("items") or {}).get(did)
+        bad = r is not None and any(e["sev"] == "bad" for e in r["errors"])
+        if bad or r is None:
+            p2["status"] = "pending"
+            if not p2.get("accepted_reason"):
+                p2.pop("accepted_reason", None)
+        if p2.get("status") != "confirmed":
+            p2["status"] = "pending"
+        safe["items"][did] = p2
+    return safe
+
+def splice_content(plan):
+    """参与确认状态的内容(变更即需重新确认): 挂接录音/锚点/拼接段。"""
+    def rnd(x):
+        return round(float(x), 4)
+    return {"takes": [str(t) for t in (plan.get("takes") or [])],
+            "anchors": {str(k): rnd(v) for k, v in (plan.get("anchors") or {}).items()},
+            "segments": [{"take_id": str(s.get("take_id")), "in": rnd(s.get("in", 0)),
+                          "out": rnd(s.get("out", 0)), "xfade": rnd(s.get("xfade") or 0),
+                          "gap": rnd(s.get("gap") or 0)}
+                         for s in (plan.get("segments") or [])]}
+
+def apply_splice_inject(st, narr_clips, nch, fr, report=None):
+    """
+    确认且通过实时校审的拼接方案 -> 合成 PCM 注入 narr_clips(键 splice:<descId>)。
+    返回 (placements覆盖:{did:placement}, 虚拟旁白:{did:info}); 调用方自行合并,
+    本函数不修改 st。阻塞/待处理方案不注入, 描述卡回退到原整段绑定。
+    """
+    plans = st.get("splice") or {}
+    items = plans.get("items") or {}
+    confirmed = {d: p for d, p in items.items() if p.get("status") == "confirmed"}
+    if not confirmed:
+        return {}, {}
+    if report is None:
+        smeta = st.get("source") or {}
+        report = splice_report(st, plans, nch, fr, smeta.get("duration", 0.0), narr_clips)
+    overrides, injected = {}, {}
+    for did, plan in confirmed.items():
+        r = report["items"].get(did)
+        if not r or any(e["sev"] == "bad" for e in r["errors"]):
+            continue
+        samples, dur, _layout, _seams, _cf = render_splice(
+            plan.get("segments") or [], narr_clips, nch, fr)
+        vid = "splice:%s" % did
+        narr_clips[vid] = (samples, nch, fr)
+        base = dict((st["placements"].get("placements", {}).get(did)) or {})
+        base["narration_id"] = vid
+        overrides[did] = base
+        names = []
+        for s in r["sources"]:
+            if s["name"] not in names:
+                names.append(s["name"])
+        injected[did] = {"id": vid, "name": "拼接·%s(%s)" % (did, "+".join(names)),
+                         "duration": round(dur, 3), "framerate": fr, "channels": nch,
+                         "levels": level_curves(samples, nch, fr),
+                         "splice": {"desc_id": did, "segments": r["segments"],
+                                    "anchors": r.get("anchors", []),
+                                    "sources": r["sources"]}}
+    return overrides, injected
+
+def spliced_state(st, overrides, injected):
+    """把拼接注入(覆盖 placements/追加虚拟旁白)合并到 st 的浅拷贝, 供校审/导出使用。"""
+    if not overrides:
+        return st
+    st2 = dict(st)
+    pl = dict(st["placements"].get("placements", {}))
+    pl.update(overrides)
+    st2["placements"] = {"placements": pl, "settings": st["placements"].get("settings", {})}
+    st2["narrations"] = list(st["narrations"]) + list(injected.values())
+    return st2
+
+def save_splice(pid, plans):
+    conn = db()
+    conn.execute("INSERT INTO splice(project_id,data_json) VALUES(?,?) "
+                 "ON CONFLICT(project_id) DO UPDATE SET data_json=excluded.data_json",
+                 (pid, json.dumps(plans, ensure_ascii=False)))
+    conn.commit()
+    conn.close()
+
 # ---------------------------------------------------------------- 时码解析
 
 def parse_tc(v):
@@ -661,6 +1044,7 @@ def get_state(pid):
         "SELECT * FROM assets WHERE project_id=? ORDER BY id", (pid,)).fetchall()
     pl = conn.execute("SELECT data_json FROM placements WHERE project_id=?", (pid,)).fetchone()
     lv = conn.execute("SELECT data_json FROM leveling WHERE project_id=?", (pid,)).fetchone()
+    sp = conn.execute("SELECT data_json FROM splice WHERE project_id=?", (pid,)).fetchone()
     revs = conn.execute(
         "SELECT id,created,summary,rationale FROM revisions WHERE project_id=? ORDER BY id DESC",
         (pid,)).fetchall()
@@ -671,6 +1055,8 @@ def get_state(pid):
              "descriptions": [], "keysounds": [],
              "placements": {"placements": {}, "settings": {}},
              "leveling": {"settings": default_level_settings(), "items": {}},
+             "splice": {"settings": dict(SPLICE_DEFAULTS), "items": {}},
+             "spliceResolved": {},
              "revisions": [dict(r) for r in revs]}
     for a in assets:
         data = json.loads(a["data_json"] or "{}")
@@ -687,6 +1073,21 @@ def get_state(pid):
         state["placements"] = json.loads(pl["data_json"])
     if lv:
         state["leveling"] = json.loads(lv["data_json"])
+    if sp:
+        state["splice"] = json.loads(sp["data_json"])
+    # 确认且健康的拼接方案: 实时校审 + 合成, 供前端显示合成时长/电平曲线
+    sp_items = state["splice"].get("items") or {}
+    if state["source"] and any(p.get("status") == "confirmed" for p in sp_items.values()):
+        try:
+            clips = load_narr_clips(pid)
+            smeta = state["source"]
+            rep = splice_report(state, state["splice"], smeta["channels"],
+                                smeta["framerate"], smeta["duration"], clips)
+            _ov, injected = apply_splice_inject(state, clips, smeta["channels"],
+                                                smeta["framerate"], rep)
+            state["spliceResolved"] = injected
+        except (FileNotFoundError, KeyError):
+            pass
     return state
 
 def save_leveling(pid, plan):
@@ -789,6 +1190,31 @@ def gen_demo_wavs(pdir):
         with open(path, "wb") as f:
             f.write(write_wav(clip, 1, fr))
         narrs.append(("旁白片段%d.wav" % idx, path, d))
+
+    # 片段5/6: 同一句话的两次补录(多版本拼接素材)。
+    # 片段5 前半咬字清楚、后半喷麦(低频爆震); 片段6 前半弱且含糊、后半干净。
+    d5 = 2.4
+    m = int(fr * d5)
+    clip5 = array("h")
+    clip6 = array("h")
+    for i in range(m):
+        t = i / fr
+        v = math.sin(2 * math.pi * (230 + 15 * math.sin(2 * math.pi * 4 * t)) * t) * 11000
+        v += random.uniform(-1, 1) * 60
+        if t > 1.2:   # 喷麦: 低频爆震
+            v += math.sin(2 * math.pi * 65 * t) * 15000 * (0.6 + 0.4 * math.sin(2 * math.pi * 2.5 * t))
+        clip5.append(max(-32768, min(32767, int(v))))
+        if t < 1.2:   # 前半弱且含糊(低频、小音量)
+            w = math.sin(2 * math.pi * 170 * t) * 2600 + random.uniform(-1, 1) * 50
+        else:         # 后半干净
+            w = math.sin(2 * math.pi * (230 + 15 * math.sin(2 * math.pi * 4 * t)) * t) * 11000
+            w += random.uniform(-1, 1) * 60
+        clip6.append(max(-32768, min(32767, int(w))))
+    for idx, clip in ((5, clip5), (6, clip6)):
+        path = os.path.join(pdir, "narr_demo_%d.wav" % idx)
+        with open(path, "wb") as f:
+            f.write(write_wav(clip, 1, fr))
+        narrs.append(("旁白片段%d.wav" % idx, path, d5))
     return narrs
 
 def create_demo():
@@ -834,6 +1260,7 @@ def create_demo():
         {"id": "ad2", "start": 12.6, "text": "周放下茶杯，走到门边，手停在门把上。"},
         {"id": "ad3", "start": 19.4, "text": "门铃响了两声。"},
         {"id": "ad4", "start": 27.0, "text": "楼道里脚步声由远及近，又停在门外。"},
+        {"id": "ad5", "start": 45.0, "text": "她撑开黑伞，走进雨里。"},
     ]})
     save_asset(pid, "keysounds", "关键声", {"items": [
         {"id": "k1", "start": 19.9, "end": 21.0, "label": "门铃", "maskable": False},
@@ -852,11 +1279,25 @@ def create_demo():
                      "ad3": {"narration_id": narr_ids[2], "start": 19.4, "duck": False,
                              "gain": 1.0, "abridged": False},
                      "ad4": {"narration_id": narr_ids[3], "start": 27.0, "duck": False,
+                             "gain": 1.0, "abridged": False},
+                     "ad5": {"narration_id": narr_ids[4], "start": 45.0, "duck": False,
                              "gain": 1.0, "abridged": False}},
                      "settings": {}}, ensure_ascii=False)))
     conn.execute("INSERT INTO leveling(project_id,data_json) VALUES(?,?)",
                  (pid, json.dumps({"settings": default_level_settings(), "items": {}},
                                   ensure_ascii=False)))
+    # 预置拼接方案(ad5, 待处理): 片段5 取前半(咬字清楚) + 片段6 取后半(避开喷麦),
+    # 锚点对齐同一语义点, 0.03s 交叉淡化; 确认后合成片段进入配平/混音/导出。
+    conn.execute("INSERT INTO splice(project_id,data_json) VALUES(?,?)",
+                 (pid, json.dumps({"settings": dict(SPLICE_DEFAULTS), "items": {
+                     "ad5": {"takes": [narr_ids[4], narr_ids[5]],
+                             "anchors": {str(narr_ids[4]): 0.4, str(narr_ids[5]): 1.6},
+                             "segments": [
+                                 {"take_id": narr_ids[4], "in": 0.0, "out": 1.25,
+                                  "xfade": 0.0, "gap": 0.0},
+                                 {"take_id": narr_ids[5], "in": 1.2, "out": 2.4,
+                                  "xfade": 0.03, "gap": 0.0}],
+                             "status": "pending"}}}, ensure_ascii=False)))
     conn.commit()
     conn.close()
     return pid
@@ -879,8 +1320,8 @@ def read_body(environ):
     n = int(environ.get("CONTENT_LENGTH") or 0)
     return environ["wsgi.input"].read(n) if n else b""
 
-def load_engine_audio(pid):
-    """读取工程正片与全部旁白片段 (src, nch, fr, {nid:(samples,nch,fr)})。"""
+def load_narr_clips(pid):
+    """读取项目全部旁白片段 {nid: (samples, nch, fr)}。"""
     conn = db()
     rows = conn.execute("SELECT id,file_path FROM assets WHERE project_id=? AND kind='narration'",
                         (pid,)).fetchall()
@@ -888,8 +1329,12 @@ def load_engine_audio(pid):
     narr_clips = {}
     for r in rows:
         with open(r["file_path"], "rb") as f:
-            s, c, fr2 = read_wav(f.read())
-        narr_clips[str(r["id"])] = (s, c, fr2)
+            narr_clips[str(r["id"])] = read_wav(f.read())
+    return narr_clips
+
+def load_engine_audio(pid):
+    """读取工程正片与全部旁白片段 (src, nch, fr, {nid:(samples,nch,fr)})。"""
+    narr_clips = load_narr_clips(pid)
     with open(os.path.join(proj_dir(pid), "source.wav"), "rb") as f:
         src, nch, fr = read_wav(f.read())
     return src, nch, fr, narr_clips
@@ -1006,6 +1451,11 @@ def route(environ, start_response):
             if not st or not st["source"]:
                 return err(start_response, "请先载入正片 WAV")
             src, nch, fr, narr_clips = load_engine_audio(pid)
+            # 确认的拼接方案合成注入(阻塞/待处理不注入, 回退原整段绑定)
+            sp_rep = splice_report(st, st.get("splice") or {}, nch, fr,
+                                   (len(src) // nch) / fr, narr_clips)
+            ov, injected = apply_splice_inject(st, narr_clips, nch, fr, sp_rep)
+            st = spliced_state(st, ov, injected)
             pdata = st["placements"]
             plist = [dict(v, desc_id=k) for k, v in pdata.get("placements", {}).items()
                      if v.get("narration_id")]
@@ -1024,6 +1474,7 @@ def route(environ, start_response):
                                               "clip": clipinfo,
                                               "confirmedLeveled": [did for did, it in eff_lv["items"].items()
                                                                    if it.get("status") == "confirmed"],
+                                              "confirmedSpliced": sorted(injected.keys()),
                                               "url": "/api/project/%d/file?which=mix" % pid})
 
         if sub == "leveling" and method == "POST":
@@ -1036,6 +1487,11 @@ def route(environ, start_response):
             if not st or not st["source"]:
                 return err(start_response, "请先载入正片 WAV")
             src, nch, fr, narr_clips = load_engine_audio(pid)
+            # 确认的拼接方案以合成片段参与配平
+            sp_rep = splice_report(st, st.get("splice") or {}, nch, fr,
+                                   (len(src) // nch) / fr, narr_clips)
+            ov, injected = apply_splice_inject(st, narr_clips, nch, fr, sp_rep)
+            st = spliced_state(st, ov, injected)
             report = leveling_report(st, plan, src, nch, fr, narr_clips)
             safe_plan = sanitize_leveling_plan(plan, report)
             save_leveling(pid, safe_plan)
@@ -1053,6 +1509,11 @@ def route(environ, start_response):
                 return err(start_response, "请先载入正片 WAV")
             plan = st.get("leveling") or {"settings": default_level_settings(), "items": {}}
             src, nch, fr, narr_clips = load_engine_audio(pid)
+            # 确认的拼接方案以合成片段参与配平校审
+            sp_rep = splice_report(st, st.get("splice") or {}, nch, fr,
+                                   (len(src) // nch) / fr, narr_clips)
+            ov, injected = apply_splice_inject(st, narr_clips, nch, fr, sp_rep)
+            st = spliced_state(st, ov, injected)
             report = leveling_report(st, plan, src, nch, fr, narr_clips)
             desc_by_id = {d["id"]: d for d in st["descriptions"]}
             to_confirm = [target_did] if target_did else report["order"]
@@ -1135,6 +1596,129 @@ def route(environ, start_response):
                                               "report": report2,
                                               "revisions": st2["revisions"]})
 
+        if sub == "splice" and method == "POST":
+            # 保存拼接方案(挂接录音/锚点/拼接段)并返回校审报告。
+            # 已确认方案的内容(takes/anchors/segments)一旦被改, 自动回到待处理,
+            # 该卡旧的配平选区/增益同时失效; 阻塞方案一律强制 pending。
+            body = json.loads(read_body(environ) or b"{}")
+            st = get_state(pid)
+            if not st or not st["source"]:
+                return err(start_response, "请先载入正片 WAV")
+            plans = {"settings": body.get("settings") or dict(SPLICE_DEFAULTS),
+                     "items": body.get("items") or {}}
+            old_items = (st.get("splice") or {}).get("items", {})
+            lv = st.get("leveling") or {"settings": default_level_settings(), "items": {}}
+            lv_changed = False
+            for did, plan in plans["items"].items():
+                old = old_items.get(did)
+                if old and old.get("status") == "confirmed" and \
+                        splice_content(old) != splice_content(plan):
+                    plan["status"] = "pending"
+                    if did in (lv.get("items") or {}):
+                        del lv["items"][did]
+                        lv_changed = True
+            if lv_changed:
+                save_leveling(pid, lv)
+            clips = load_narr_clips(pid)
+            smeta = st["source"]
+            report = splice_report(st, plans, smeta["channels"], smeta["framerate"],
+                                   smeta["duration"], clips)
+            safe = sanitize_splice(plans, report)
+            save_splice(pid, safe)
+            st["splice"] = safe
+            _ov, injected = apply_splice_inject(st, clips, smeta["channels"],
+                                                smeta["framerate"], report)
+            return json_resp(start_response, {"report": report, "plans": safe,
+                                              "resolved": injected})
+
+        if sub == "spliceconfirm" and method == "POST":
+            # 确认单个拼接方案。硬规则: 锚点倒序/来源缺失/接缝削波/压住对白关键声/
+            # 格式不一致/重叠越界等阻塞存在时, 无论是否填写人工理由都保持 pending,
+            # 合成结果不进配平/混音/脚本/复演; 理由只写入修订留痕。
+            body = json.loads(read_body(environ) or b"{}")
+            did = body.get("desc_id")
+            reason = (body.get("accepted_reason") or "").strip()
+            st = get_state(pid)
+            if not st or not st["source"]:
+                return err(start_response, "请先载入正片 WAV")
+            plans = st.get("splice") or {"settings": dict(SPLICE_DEFAULTS), "items": {}}
+            plan = plans.get("items", {}).get(did)
+            if not plan:
+                return err(start_response, "该描述卡没有拼接方案")
+            clips = load_narr_clips(pid)
+            smeta = st["source"]
+            report = splice_report(st, plans, smeta["channels"], smeta["framerate"],
+                                   smeta["duration"], clips)
+            r = report["items"].get(did)
+            bad = [e for e in r["errors"] if e["sev"] == "bad"] if r else []
+
+            def add_splice_revision(blocked_flag):
+                src_names = "+".join(s["name"] for s in r["sources"]) if r else ""
+                cuts = "; ".join("%s[%s–%s]⤿%.2fs" % (
+                    s["name"], fmt_tc(s["in"]), fmt_tc(s["out"]), s["xfade"])
+                    for s in (r["segments"] if r else []))
+                snap = {"kind": "splice_pending" if blocked_flag else "splice",
+                        "desc_id": did,
+                        "segments": r["segments"] if r else [],
+                        "anchors": plan.get("anchors") or {},
+                        "duration": r["duration"] if r else 0.0,
+                        "sources": r["sources"] if r else [],
+                        "seams": r["seams"] if r else [],
+                        "blocked": blocked_flag,
+                        "blockedErrors": [e["code"] for e in bad] if blocked_flag else [],
+                        "accepted_reason": reason, "settings": plans["settings"]}
+                if blocked_flag:
+                    summary = "旁白拼接保持待处理 %s [%s] %s" % (
+                        did, fmt_tc(r["start"] if r else 0), src_names)
+                    rationale = reason
+                else:
+                    summary = "旁白拼接确认 %s [%s] %d段·合成%.3fs(%s)" % (
+                        did, fmt_tc(r["start"]), len(r["segments"]), r["duration"], src_names)
+                    rationale = reason or "两次补录各取一段,切点: %s" % cuts
+                conn2 = db()
+                conn2.execute("INSERT INTO revisions(project_id,created,summary,rationale,snapshot_json) "
+                              "VALUES(?,?,?,?,?)",
+                              (pid, time.time(), summary, rationale,
+                               json.dumps(snap, ensure_ascii=False)))
+                conn2.commit(); conn2.close()
+
+            if bad or r is None:
+                plan["status"] = "pending"
+                if reason:
+                    plan["accepted_reason"] = reason
+                    add_splice_revision(True)
+                else:
+                    plan.pop("accepted_reason", None)
+                plans["items"][did] = plan
+                save_splice(pid, sanitize_splice(plans, report))
+                st2 = get_state(pid)
+                return json_resp(start_response, {
+                    "ok": False, "confirmed": [],
+                    "blocked": [{"desc_id": did,
+                                 "errors": [e["msg"] for e in bad],
+                                 "codes": [e["code"] for e in bad],
+                                 "reasonLogged": bool(reason)}],
+                    "report": report, "resolved": st2["spliceResolved"],
+                    "revisions": st2["revisions"]})
+            # 无阻塞: 确认; 合成片段替代原整段绑定, 该卡旧配平选区/增益失效
+            plan["status"] = "confirmed"
+            if reason:
+                plan["accepted_reason"] = reason
+            else:
+                plan.pop("accepted_reason", None)
+            plans["items"][did] = plan
+            add_splice_revision(False)
+            lv = st.get("leveling") or {"items": {}}
+            if did in (lv.get("items") or {}):
+                del lv["items"][did]
+                save_leveling(pid, lv)
+            save_splice(pid, sanitize_splice(plans, report))
+            st2 = get_state(pid)
+            return json_resp(start_response, {"ok": True, "confirmed": [did], "blocked": [],
+                                              "report": report,
+                                              "resolved": st2["spliceResolved"],
+                                              "revisions": st2["revisions"]})
+
         if sub == "file" and method == "GET":
             which = qs.get("which", ["source"])[0]
             if which in ("source", "mix"):
@@ -1182,15 +1766,33 @@ def route(environ, start_response):
             st = get_state(pid)
             if not st:
                 return err(start_response, "项目不存在", "404 Not Found")
-            # 导出前统一实时校审: 阻塞片段不得在脚本/复演里以 confirmed 与增益出现
+            # 导出前统一实时校审: 阻塞片段不得在脚本/复演里以 confirmed 与增益出现;
+            # 拼接方案同样: 阻塞/待处理不注入, 确认版合成片段进入配平/脚本/复演。
             stored_lv = st.get("leveling") or {"settings": default_level_settings(), "items": {}}
+            sp_stored = st.get("splice") or {"settings": dict(SPLICE_DEFAULTS), "items": {}}
+            sp_eff = sp_stored
+            sp_blocked = {}
             lv_report = None
             if st.get("source"):
                 try:
                     src2, nc2, fr2, clips2 = load_engine_audio(pid)
+                    sp_rep = splice_report(st, sp_stored, nc2, fr2,
+                                           st["source"]["duration"], clips2)
+                    sp_eff = sanitize_splice(sp_stored, sp_rep)
+                    ov, injected = apply_splice_inject(st, clips2, nc2, fr2, sp_rep)
+                    st = spliced_state(st, ov, injected)
+                    sp_blocked = {did: [e["code"] for e in r["errors"] if e["sev"] == "bad"]
+                                  for did, r in sp_rep["items"].items()
+                                  if any(e["sev"] == "bad" for e in r["errors"])}
                     lv_report = leveling_report(st, stored_lv, src2, nc2, fr2, clips2)
                 except FileNotFoundError:
                     lv_report = None
+                    sp_eff = sanitize_splice(sp_stored, {"items": {}})
+                    st["splice"] = sp_eff
+            else:
+                sp_eff = sanitize_splice(sp_stored, {"items": {}})
+            st["splice"] = sp_eff
+            st["spliceBlocked"] = sp_blocked
             if lv_report is not None:
                 eff_lv = sanitize_leveling_plan(stored_lv, lv_report)
                 blocked_map = {did: [e["code"] for e in r["errors"] if e["sev"] == "bad"]
@@ -1228,6 +1830,7 @@ def route(environ, start_response):
                           "scenes": st["scenes"], "descriptions": st["descriptions"],
                           "keysounds": st["keysounds"], "placements": st["placements"],
                           "leveling": replay_lv,
+                          "splice": sp_eff,
                           "exported_at": time.time()}
                 body = json.dumps(replay, ensure_ascii=False, indent=2).encode("utf-8")
                 start_response("200 OK", [
@@ -1323,6 +1926,25 @@ def build_script(st):
                 if lv.get("accepted_reason"):
                     note += " 人工留痕(不改状态): " + lv["accepted_reason"]
                 L.append("    响度配平: " + note)
+        # 旁白拼接: 确认版给出来源与切点; 待处理/阻塞方案只标注, 合成不进确认版
+        if narr and narr.get("splice"):
+            spi = narr["splice"]
+            cuts = " + ".join("%s[%s–%s]%s" % (
+                s["name"], fmt_tc(s["in"]), fmt_tc(s["out"]),
+                ("⤿%.2fs" % s["xfade"]) if s.get("xfade") else "")
+                for s in spi.get("segments", []))
+            L.append("    旁白拼接: 已确认 %d段合成 %.3fs = %s" % (
+                len(spi.get("segments", [])), narr["duration"], cuts))
+        sp_items = (st.get("splice") or {}).get("items", {})
+        sp_blocked = st.get("spliceBlocked") or {}
+        plan2 = sp_items.get(d["id"])
+        if plan2 and not (narr and narr.get("splice")):
+            note = "待处理(未确认,合成不参与混音/配平/导出)"
+            if sp_blocked.get(d["id"]):
+                note += " 阻塞: " + "、".join(sp_blocked[d["id"]])
+            if plan2.get("accepted_reason"):
+                note += " 人工留痕(不改状态): " + plan2["accepted_reason"]
+            L.append("    旁白拼接: " + note)
     if st.get("revisions"):
         L.append("")
         L.append("# 修订记录")

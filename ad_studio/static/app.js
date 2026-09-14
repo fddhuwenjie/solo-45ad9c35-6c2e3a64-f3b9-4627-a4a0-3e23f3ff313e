@@ -4,6 +4,7 @@
 // ---------------------------------------------------------------- 状态
 const DEFAULT_LV = { targetDb: -20, ceilingDb: -1, maxJumpDb: 3, minSpeech: 0.3,
                      minGainDb: -14, maxGainDb: 15.6 };
+const DEFAULT_SPL = { zeroxMs: 2, gapWarnS: 0.05, seamCeilingDb: -1 };
 const S = {
   projectId: null,
   source: null,          // {name,duration,framerate,channels,peaks}
@@ -14,6 +15,10 @@ const S = {
   leveling: { settings: { ...DEFAULT_LV }, items: {} },  // 方案(ranges/gain/status)
   lvReport: null,        // 后端最近一次配平报告
   lvTimer: null,
+  splice: { settings: { ...DEFAULT_SPL }, items: {} }, // 拼接方案(takes/anchors/segments)
+  spliceReport: null,    // 后端最近一次拼接校审报告
+  spliceResolved: {},    // descId -> 确认版合成片段 {id,name,duration,levels,splice}
+  spTimer: null,
   abAudio: null,         // {descId, mode, nodes, start, a, b}
   issues: [],
   undoStack: [],
@@ -21,6 +26,8 @@ const S = {
   playhead: 0,
   loopRegion: null,      // {a,b,issueIdx}
 };
+// 拼接编辑器暂态: did=当前描述卡, sel=候选选区{takeId,a,b}, play=试听节点, draftSel=拖拽中
+const spEd = { did: null, sel: null, play: null, drag: null };
 const $ = (id) => document.getElementById(id);
 
 // ---------------------------------------------------------------- 工具
@@ -73,6 +80,11 @@ async function loadProject(pid) {
   Object.assign(S.settings, st.placements.settings || {});
   S.leveling = { settings: { ...DEFAULT_LV, ...(st.leveling.settings || {}) },
                  items: st.leveling.items || {} };
+  S.splice = { settings: { ...DEFAULT_SPL, ...((st.splice || {}).settings || {}) },
+               items: (st.splice || {}).items || {} };
+  S.spliceResolved = st.spliceResolved || {};
+  S.spliceReport = null;
+  spEd.did = null; spEd.sel = null; spStop();
   S.lvReport = null; S.abAudio = null;
   S.issues = []; S.undoStack = []; S.loopRegion = null; S.playhead = 0;
   AudioEngine.reset();
@@ -83,9 +95,12 @@ async function loadProject(pid) {
       ["maxJumpDb","lvMaxJump"],["minSpeech","lvMinSpeech"],
       ["minGainDb","lvMinGain"],["maxGainDb","lvMaxGain"]])
     $(id).value = S.leveling.settings[k];
+  for (const [k, id] of [["zeroxMs","spZerox"],["gapWarnS","spGap"],["seamCeilingDb","spCeil"]])
+    $(id).value = S.splice.settings[k];
   renderAssets(); renderDescList(); resizeCanvas(); runChecks(); renderRevisions(st.revisions);
-  renderLeveling();
+  renderLeveling(); renderSplice();
   ensureLevelCurves().then(computeLeveling);
+  if (Object.keys(S.splice.items).length) computeSplice();
   ["btnExportScript", "btnExportReplay"].forEach(id => $(id).disabled = false);
   $("btnExportMix").disabled = false;
 }
@@ -148,7 +163,19 @@ $("fileScript").addEventListener("change", async (e) => {
 });
 
 // ---------------------------------------------------------------- 描述卡列表
-function narrDur(p) {
+// 描述卡的有效旁白: 确认版拼接合成片段优先, 否则整段绑定
+function effNarrOf(d) {
+  const rs = S.spliceResolved[d.id];
+  if (rs) return rs;
+  const p = S.placements[d.id];
+  if (!p || !p.narration_id) return null;
+  return S.narrations.find(x => String(x.id) === String(p.narration_id)) || null;
+}
+function narrDur(p, d) {
+  if (d) {
+    const n = effNarrOf(d);
+    return n ? n.duration : null;
+  }
   if (!p || !p.narration_id) return null;
   const n = S.narrations.find(x => String(x.id) === String(p.narration_id));
   return n ? n.duration : null;
@@ -162,14 +189,14 @@ function estDur(d) {
 // 缩写压缩倍速(>1 缩短); 目标时长 = 字数/目标语速(下限0.8s), 与服务端 abridge_speed 一致
 function abridgeFactor(d) {
   const p = S.placements[d.id];
-  const nd = narrDur(p);
+  const nd = narrDur(p, d);
   if (!p || !p.abridged || nd == null) return 1;
   const target = Math.max(0.8, (d.text || "").length / S.settings.maxRate);
   return target < nd ? nd / target : 1;
 }
 function cardDur(d) {
   const p = S.placements[d.id];
-  const nd = narrDur(p);
+  const nd = narrDur(p, d);
   if (nd != null) return nd / abridgeFactor(d);
   return estDur(d);
 }
@@ -187,16 +214,22 @@ function renderDescList() {
     const p = S.placements[d.id];
     const div = document.createElement("div");
     div.className = "desc-item";
-    const nd = narrDur(p);
+    const nd = narrDur(p, d);
     const dur = cardDur(d);
     const rate = (d.text || "").length / dur;
-    const badge = p && p.narration_id
-      ? (dur < nd - 1e-6
-          ? `<span class="badge ok">旁白 ${dur.toFixed(2)}s(缩写自 ${nd.toFixed(2)}s)</span>`
-          : `<span class="badge ok">旁白 ${nd.toFixed(2)}s</span>`)
-      : `<span class="badge warn">估算 ${dur.toFixed(2)}s</span>`;
+    const spPlan = S.splice.items[d.id];
+    const spRes = S.spliceResolved[d.id];
+    const badge = spRes
+      ? `<span class="badge ok">拼接 ${spRes.splice.segments.length}段 ${dur.toFixed(2)}s</span>`
+      : (p && p.narration_id)
+        ? (dur < nd - 1e-6
+            ? `<span class="badge ok">旁白 ${dur.toFixed(2)}s(缩写自 ${nd.toFixed(2)}s)</span>`
+            : `<span class="badge ok">旁白 ${nd.toFixed(2)}s</span>`)
+        : `<span class="badge warn">估算 ${dur.toFixed(2)}s</span>`;
+    const spBadge = !spRes && spPlan && (spPlan.segments || []).length
+      ? `<span class="badge warn">拼接待处理</span>` : "";
     div.innerHTML = `
-      <div class="text"><b>${d.id}</b> ${d.text || ""} ${badge}
+      <div class="text"><b>${d.id}</b> ${d.text || ""} ${badge}${spBadge}
         <span class="badge ${rate > S.settings.maxRate ? "bad" : "ok"}">${rate.toFixed(1)}字/s</span></div>
       <div class="row">
         <label>旁白 <select class="narr-sel"><option value="">(未绑定)</option></select></label>
@@ -204,6 +237,7 @@ function renderDescList() {
         <label><input type="checkbox" class="duck"> 局部压低原声</label>
         <label><input type="checkbox" class="abridged" ${p && p.abridged ? "checked" : ""}> 缩写稿</label>
         <button class="auto-place">自动找空档</button>
+        <button class="go-splice" title="多版本拼接: 挂接多版录音,切分取段合成">🧩 拼接</button>
       </div>`;
     const sel = div.querySelector(".narr-sel");
     for (const n of S.narrations) {
@@ -238,23 +272,28 @@ function renderDescList() {
       else ensurePlacement(d).start = t;
       afterEdit();
     });
+    div.querySelector(".go-splice").addEventListener("click", () => {
+      spEd.did = d.id;
+      renderSplice();
+      $("spliceEditor").scrollIntoView({ behavior: "smooth", block: "center" });
+    });
     box.appendChild(div);
   }
 }
 
 function afterEdit() {
   renderDescList(); draw(); runChecks(); savePlacements(); AudioEngine.invalidateMix();
-  renderLeveling(); scheduleLeveling();
+  renderLeveling(); scheduleLeveling(); renderSplice(); scheduleSplice();
 }
 function pushUndo() {
-  S.undoStack.push(JSON.stringify({ p: S.placements, l: S.leveling.items }));
+  S.undoStack.push(JSON.stringify({ p: S.placements, l: S.leveling.items, s: S.splice.items }));
   if (S.undoStack.length > 50) S.undoStack.shift();
 }
 $("btnUndo").addEventListener("click", () => {
   const s = S.undoStack.pop();
   if (!s) return;
   const u = JSON.parse(s);
-  S.placements = u.p; S.leveling.items = u.l || {};
+  S.placements = u.p; S.leveling.items = u.l || {}; S.splice.items = u.s || {};
   afterEdit();
 });
 
@@ -523,6 +562,19 @@ function runChecks() {
       }
     }
   }
+  // 8. 旁白拼接: 阻塞(锚点倒序/来源缺失/接缝削波/压住对白关键声等)保持待处理
+  if (S.spliceReport) {
+    for (const did of S.spliceReport.order || []) {
+      const r = S.spliceReport.items[did];
+      for (const e of r.errors.filter(x => x.sev === "bad")) {
+        issues.push({ type: "splice", descId: did, sev: "bad",
+          region: [r.start, r.start + Math.max(0.4, r.duration)],
+          title: `拼接阻塞 · ${did}`,
+          detail: e.msg + "。修正前合成结果不参与配平/混音/导出。",
+          solutions: ["goSplice"] });
+      }
+    }
+  }
   S.issues = issues;
   renderIssues();
   draw();
@@ -545,7 +597,7 @@ function renderIssues() {
       </div>`;
     const ops = div.querySelector(".ops");
     const labels = { autoMove: "⇢ 移到空档", duck: "🔉 局部压低", abridge: "✂ 缩写稿",
-                     accept: "✔ 保留并记录", goLeveling: "🎚 去响度配平" };
+                     accept: "✔ 保留并记录", goLeveling: "🎚 去响度配平", goSplice: "🧩 去旁白拼接" };
     for (const s of it.solutions) {
       const b = document.createElement("button");
       b.textContent = labels[s];
@@ -580,6 +632,15 @@ function applySolution(it, kind) {
       el.classList.add("flash");
       setTimeout(() => el.classList.remove("flash"), 1600);
     }
+    return;
+  }
+  if (kind === "goSplice") {
+    spEd.did = it.descId;
+    renderSplice();
+    const el = $("spliceEditor");
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    el.classList.add("flash");
+    setTimeout(() => el.classList.remove("flash"), 1600);
     return;
   }
   pushUndo();
@@ -645,9 +706,10 @@ function lvItem(did) {
 }
 const lvRanges = (did) => {
   const it = S.leveling.items[did];
-  const n = S.narrations.find(x => String(x.id) === String(S.placements[did]?.narration_id));
-  const d = n ? n.duration : 0;
-  return (it && it.ranges && it.ranges.length) ? it.ranges : [{ start: 0, end: d }];
+  const d = S.descriptions.find(x => x.id === did);
+  const n = d ? effNarrOf(d) : null;
+  const dur = n ? n.duration : 0;
+  return (it && it.ranges && it.ranges.length) ? it.ranges : [{ start: 0, end: dur }];
 };
 
 async function ensureLevelCurves() {
@@ -663,14 +725,16 @@ async function ensureLevelCurves() {
 function renderLeveling() {
   const box = $("levelingList");
   box.innerHTML = "";
-  const bound = S.descriptions.filter(d => S.placements[d.id] && S.placements[d.id].narration_id);
+  const bound = S.descriptions.filter(d =>
+    (S.placements[d.id] && S.placements[d.id].narration_id) || S.spliceResolved[d.id]);
   if (!bound.length) {
     box.innerHTML = `<div class="muted small" style="padding:6px">绑定旁白后即可配平</div>`;
     return;
   }
   for (const d of bound) {
-    const p = S.placements[d.id];
-    const n = S.narrations.find(x => String(x.id) === String(p.narration_id));
+    const p = S.placements[d.id] || { start: d.start || 0 };
+    const n = effNarrOf(d);
+    if (!n) continue;
     const it = lvItem(d.id);
     const r = S.lvReport && S.lvReport.items[d.id];
     const div = document.createElement("div");
