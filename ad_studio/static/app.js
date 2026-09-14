@@ -139,16 +139,28 @@ function narrDur(p) {
   return n ? n.duration : null;
 }
 function estDur(d) {
-  const rate = d.abridged ? S.settings.maxRate : S.settings.maxRate * 0.8;
+  const p = S.placements[d.id];
+  const abridged = !!(p && p.abridged);
+  const rate = abridged ? S.settings.maxRate : S.settings.maxRate * 0.8;
   return Math.max(0.8, (d.text || "").length / rate);
+}
+// 缩写压缩倍速(>1 缩短); 目标时长 = 字数/目标语速(下限0.8s), 与服务端 abridge_speed 一致
+function abridgeFactor(d) {
+  const p = S.placements[d.id];
+  const nd = narrDur(p);
+  if (!p || !p.abridged || nd == null) return 1;
+  const target = Math.max(0.8, (d.text || "").length / S.settings.maxRate);
+  return target < nd ? nd / target : 1;
 }
 function cardDur(d) {
   const p = S.placements[d.id];
-  return narrDur(p) || estDur(d);
+  const nd = narrDur(p);
+  if (nd != null) return nd / abridgeFactor(d);
+  return estDur(d);
 }
 function ensurePlacement(d) {
   if (!S.placements[d.id]) {
-    S.placements[d.id] = { narration_id: null, start: d.start || 0, duck: false, gain: 1.0 };
+    S.placements[d.id] = { narration_id: null, start: d.start || 0, duck: false, gain: 1.0, abridged: false };
   }
   return S.placements[d.id];
 }
@@ -160,10 +172,13 @@ function renderDescList() {
     const p = S.placements[d.id];
     const div = document.createElement("div");
     div.className = "desc-item";
+    const nd = narrDur(p);
     const dur = cardDur(d);
     const rate = (d.text || "").length / dur;
     const badge = p && p.narration_id
-      ? `<span class="badge ok">旁白 ${dur.toFixed(2)}s</span>`
+      ? (dur < nd - 1e-6
+          ? `<span class="badge ok">旁白 ${dur.toFixed(2)}s(缩写自 ${nd.toFixed(2)}s)</span>`
+          : `<span class="badge ok">旁白 ${nd.toFixed(2)}s</span>`)
       : `<span class="badge warn">估算 ${dur.toFixed(2)}s</span>`;
     div.innerHTML = `
       <div class="text"><b>${d.id}</b> ${d.text || ""} ${badge}
@@ -172,7 +187,7 @@ function renderDescList() {
         <label>旁白 <select class="narr-sel"><option value="">(未绑定)</option></select></label>
         <label>起点 <input class="tc mono" value="${fmtTC(p ? p.start : (d.start || 0))}"></label>
         <label><input type="checkbox" class="duck"> 局部压低原声</label>
-        <label><input type="checkbox" class="abridged" ${d.abridged ? "checked" : ""}> 缩写稿</label>
+        <label><input type="checkbox" class="abridged" ${p && p.abridged ? "checked" : ""}> 缩写稿</label>
         <button class="auto-place">自动找空档</button>
       </div>`;
     const sel = div.querySelector(".narr-sel");
@@ -198,7 +213,7 @@ function renderDescList() {
     duck.checked = !!(p && p.duck);
     duck.addEventListener("change", () => { pushUndo(); ensurePlacement(d).duck = duck.checked; afterEdit(); });
     div.querySelector(".abridged").addEventListener("change", (ev) => {
-      pushUndo(); d.abridged = ev.target.checked; afterEdit();
+      pushUndo(); ensurePlacement(d).abridged = ev.target.checked; afterEdit();
     });
     div.querySelector(".auto-place").addEventListener("click", () => {
       pushUndo();
@@ -215,15 +230,13 @@ function afterEdit() {
   renderDescList(); draw(); runChecks(); savePlacements(); AudioEngine.invalidateMix();
 }
 function pushUndo() {
-  S.undoStack.push(JSON.stringify({ p: S.placements, d: S.descriptions.map(x => ({ id: x.id, abridged: x.abridged })) }));
+  S.undoStack.push(JSON.stringify(S.placements));
   if (S.undoStack.length > 50) S.undoStack.shift();
 }
 $("btnUndo").addEventListener("click", () => {
   const s = S.undoStack.pop();
   if (!s) return;
-  const o = JSON.parse(s);
-  S.placements = o.p;
-  for (const dd of o.d) { const t = S.descriptions.find(x => x.id === dd.id); if (t) t.abridged = dd.abridged; }
+  S.placements = JSON.parse(s);
   afterEdit();
 });
 
@@ -506,7 +519,7 @@ function renderIssues() {
       const d = S.descriptions.find(x => x.id === it.descId);
       const p = d && S.placements[d.id];
       if (s === "duck" && p && p.duck) b.classList.add("on");
-      if (s === "abridge" && d && d.abridged) b.classList.add("on");
+      if (s === "abridge" && p && p.abridged) b.classList.add("on");
       b.addEventListener("click", () => applySolution(it, s));
       ops.appendChild(b);
     }
@@ -535,7 +548,7 @@ function applySolution(it, kind) {
   } else if (kind === "duck") {
     p.duck = !p.duck;
   } else if (kind === "abridge") {
-    d.abridged = !d.abridged;
+    p.abridged = !p.abridged;
   } else if (kind === "accept") {
     p.accepted = !p.accepted;
     if (p.accepted) toast("已标记保留,请在右侧记录采用理由");
@@ -602,6 +615,30 @@ const AudioEngine = {
       this.narrBufs[id] = await this.decode(`/api/project/${S.projectId}/file?which=narr_${id}`);
     return this.narrBufs[id];
   },
+  // 线性插值压缩时长(缩写稿), 与服务端 time_compress 同算法
+  resampleBuffer(buf, factor) {
+    if (factor === 1) return buf;
+    const ctx = this.ensureCtx();
+    const n = Math.max(1, Math.round(buf.length / factor));
+    const out = ctx.createBuffer(buf.numberOfChannels, n, buf.sampleRate);
+    for (let c = 0; c < buf.numberOfChannels; c++) {
+      const sd = buf.getChannelData(c), od = out.getChannelData(c);
+      for (let j = 0; j < n; j++) {
+        const pos = j * factor;
+        const i0 = Math.floor(pos), i1 = Math.min(i0 + 1, buf.length - 1), fr = pos - i0;
+        od[j] = sd[i0] * (1 - fr) + sd[i1] * fr;
+      }
+    }
+    return out;
+  },
+  // 旁白有效片段(缩写则压缩); 带缓存, placements 变化时 invalidateMix 清掉
+  async effectiveNarr(d) {
+    const p = S.placements[d.id];
+    let nb = await this.loadNarr(p.narration_id);
+    const f = abridgeFactor(d);
+    if (f !== 1) nb = this.resampleBuffer(nb, f);
+    return nb;
+  },
   // 客户端混合预览: 原声 × 压低包络 + 各旁白(与 Python render_mix 同规则)
   async buildMix() {
     if (this.mixBuf) return this.mixBuf;
@@ -610,24 +647,25 @@ const AudioEngine = {
     const sr = src.sampleRate, n = src.length, nch = src.numberOfChannels;
     const out = ctx.createBuffer(nch, n, sr);
     const duckTo = S.settings.duck_to, pad = S.settings.duck_pad, ramp = 0.15;
-    const env = new Float32Array(n).fill(1);
+    // 先备好各旁白有效片段(缩写已压缩), 再算压低包络
     const jobs = [];
     for (const d of S.descriptions) {
       const p = S.placements[d.id];
       if (!p || !p.narration_id) continue;
-      const nb = await this.loadNarr(p.narration_id);
-      jobs.push({ p, nb });
-      if (p.duck) {
-        const dur = nb.duration;
-        const f0 = Math.max(0, Math.floor((p.start - pad) * sr));
-        const f1 = Math.min(n, Math.ceil((p.start + dur + pad) * sr));
-        const r = Math.floor(ramp * sr);
-        for (let f = f0; f < f1; f++) {
-          let g = duckTo;
-          if (f - f0 < r) g = 1 - (1 - duckTo) * (f - f0) / r;
-          else if (f1 - f < r) g = 1 - (1 - duckTo) * (f1 - f) / r;
-          if (g < env[f]) env[f] = g;
-        }
+      jobs.push({ p, nb: await this.effectiveNarr(d) });
+    }
+    const env = new Float32Array(n).fill(1);
+    for (const { p, nb } of jobs) {
+      if (!p.duck) continue;
+      const dur = nb.duration;
+      const f0 = Math.max(0, Math.floor((p.start - pad) * sr));
+      const f1 = Math.min(n, Math.ceil((p.start + dur + pad) * sr));
+      const r = Math.floor(ramp * sr);
+      for (let f = f0; f < f1; f++) {
+        let g = duckTo;
+        if (f - f0 < r) g = 1 - (1 - duckTo) * (f - f0) / r;
+        else if (f1 - f < r) g = 1 - (1 - duckTo) * (f1 - f) / r;
+        if (g < env[f]) env[f] = g;
       }
     }
     for (let c = 0; c < nch; c++) {
@@ -660,12 +698,12 @@ const AudioEngine = {
     let buf;
     if (mode === "source") buf = await this.loadSource();
     else if (mode === "mix") buf = await this.buildMix();
-    else { // 仅旁白: 逐段调度
+    else { // 仅旁白: 逐段调度(缩写片段用压缩后的有效音频)
       const t0 = ctx.currentTime + 0.05;
       for (const d of S.descriptions) {
         const p = S.placements[d.id];
         if (!p || !p.narration_id) continue;
-        const nb = await this.loadNarr(p.narration_id);
+        const nb = await this.effectiveNarr(d);
         const a = p.start, b = p.start + nb.duration;
         if (end != null && (b < offset || a > end)) continue;
         const src = ctx.createBufferSource();

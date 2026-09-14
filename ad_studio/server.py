@@ -117,6 +117,31 @@ def convert(samples, src_ch, src_fr, dst_ch, dst_fr):
         samples = out
     return samples
 
+def time_compress(samples, nch, factor):
+    """线性插值按 factor(>1 缩短)压缩时长, 与前端 resampleBuffer 同算法。"""
+    n_src = len(samples) // nch
+    n_dst = max(1, int(round(n_src / factor)))
+    out = array("h")
+    for j in range(n_dst):
+        pos = j * factor
+        i0 = int(pos)
+        i1 = min(i0 + 1, n_src - 1)
+        frac = pos - i0
+        for c in range(nch):
+            v = samples[i0 * nch + c] * (1 - frac) + samples[i1 * nch + c] * frac
+            out.append(int(v))
+    return out
+
+def abridge_speed(p, clip_dur, text_len, settings):
+    """缩写稿: 目标时长 = 字数/目标语速(下限0.8s); 返回压缩倍速(1=不压缩)。"""
+    if not p.get("abridged"):
+        return 1.0
+    max_rate = float(settings.get("maxRate", 5.5))
+    if max_rate <= 0 or clip_dur <= 0:
+        return 1.0
+    target = max(0.8, text_len / max_rate)
+    return clip_dur / target if target < clip_dur else 1.0
+
 def make_peaks(samples, nch, fr, buckets=4000):
     """供前端波形绘制的 min/max 峰值包络。"""
     n = len(samples) // nch
@@ -139,27 +164,38 @@ def make_peaks(samples, nch, fr, buckets=4000):
 
 # ---------------------------------------------------------------- 混音
 
-def render_mix(src_samples, nch, fr, placements, narr_clips, settings):
+def render_mix(src_samples, nch, fr, placements, narr_clips, settings, desc_texts=None):
     """
-    placements: [{narration_id, start, duck, gain}]
+    placements: [{narration_id, start, duck, gain, abridged, desc_id}]
     narr_clips: {id: (samples, nch, fr)} 原始片段, 此处转换到工程格式
-    duck: 在旁白前后 pad 内把原声压到 settings.duck_to, 0.15s 斜坡
+    desc_texts: {desc_id: text} 用于缩写稿计算目标时长
+    duck: 在旁白(压缩后)前后 pad 内把原声压到 settings.duck_to, 0.15s 斜坡
     """
+    desc_texts = desc_texts or {}
     n_frames = len(src_samples) // nch
     duck_to = float(settings.get("duck_to", 0.35))
     pad = float(settings.get("duck_pad", 0.15))
     ramp = 0.15
 
-    # 压低包络(每帧增益)
-    env = [1.0] * n_frames
+    # 预处理各旁白: 格式转换 + 缩写压缩, 得到有效时长
+    prepared = []  # (placement, samples, dur)
     for p in placements:
-        if not p.get("duck"):
-            continue
         clip = narr_clips.get(str(p["narration_id"]))
         if not clip:
             continue
         cs, cc, cf = clip
-        dur = (len(cs) // cc) / cf
+        cs = convert(cs, cc, cf, nch, fr)
+        speed = abridge_speed(p, (len(cs) // nch) / fr,
+                              len(desc_texts.get(p.get("desc_id"), "")), settings)
+        if speed != 1.0:
+            cs = time_compress(cs, nch, speed)
+        prepared.append((p, cs, (len(cs) // nch) / fr))
+
+    # 压低包络(每帧增益)
+    env = [1.0] * n_frames
+    for p, cs, dur in prepared:
+        if not p.get("duck"):
+            continue
         t0 = float(p["start"]) - pad
         t1 = float(p["start"]) + dur + pad
         f0, f1 = max(0, int(t0 * fr)), min(n_frames, int(t1 * fr))
@@ -183,12 +219,7 @@ def render_mix(src_samples, nch, fr, placements, narr_clips, settings):
             out[base + c] = src_samples[base + c] * g
 
     # 叠旁白
-    for p in placements:
-        clip = narr_clips.get(str(p["narration_id"]))
-        if not clip:
-            continue
-        cs, cc, cf = clip
-        cs = convert(cs, cc, cf, nch, fr)
+    for p, cs, dur in prepared:
         gain = float(p.get("gain", 1.0))
         start_f = int(float(p["start"]) * fr)
         cn = len(cs) // nch
@@ -526,7 +557,9 @@ def route(environ, start_response):
             pdata = st["placements"]
             plist = [dict(v, desc_id=k) for k, v in pdata.get("placements", {}).items()
                      if v.get("narration_id")]
-            mixed = render_mix(src, nch, fr, plist, narr_clips, pdata.get("settings", {}))
+            desc_texts = {d["id"]: d.get("text", "") for d in st["descriptions"]}
+            mixed = render_mix(src, nch, fr, plist, narr_clips, pdata.get("settings", {}),
+                               desc_texts)
             wav_bytes = write_wav(mixed, nch, fr)
             with open(os.path.join(proj_dir(pid), "mix.wav"), "wb") as f:
                 f.write(wav_bytes)
@@ -626,26 +659,43 @@ def build_script(st):
     L.append("")
     narr_by_id = {str(n["id"]): n for n in st["narrations"]}
     desc_by_id = {d["id"]: d for d in st["descriptions"]}
+    settings = st["placements"].get("settings", {})
+    max_rate = float(settings.get("maxRate", 5.5)) or 5.5
+
+    def eff_duration(d, p, narr):
+        """与前端 cardDur 一致: 绑定片段按缩写压缩, 未绑定按语速估算。"""
+        text_len = len(d.get("text", ""))
+        if narr:
+            dur = narr["duration"]
+            if p.get("abridged"):
+                target = max(0.8, text_len / max_rate)
+                return min(dur, target), dur
+            return dur, None
+        rate = max_rate if p.get("abridged") else max_rate * 0.8
+        return max(0.8, text_len / rate), None
+
     rows = []
     for did, p in st["placements"].get("placements", {}).items():
         d = desc_by_id.get(did)
         if not d:
             continue
         narr = narr_by_id.get(str(p.get("narration_id")))
-        dur = narr["duration"] if narr else None
-        rows.append((float(p.get("start", 0)), d, p, narr, dur))
+        dur, orig = eff_duration(d, p, narr)
+        rows.append((float(p.get("start", 0)), d, p, narr, dur, orig))
     rows.sort()
-    for start, d, p, narr, dur in rows:
-        end = start + dur if dur else start
+    for start, d, p, narr, dur, orig in rows:
+        end = start + dur
         flags = []
+        if p.get("abridged"):
+            flags.append("缩写稿" + ("(原 %.3fs)" % orig if orig else ""))
         if p.get("duck"):
             flags.append("局部压低原声")
         if p.get("accepted"):
             flags.append("保留冲突(已记录理由)")
         L.append("[%s -> %s] %s" % (fmt_tc(start), fmt_tc(end), d.get("text", "")))
-        L.append("    旁白素材: %s%s%s" % (
+        L.append("    旁白素材: %s  时长 %.3fs%s" % (
             narr["name"] if narr else "(未绑定, 按语速估算)",
-            "  时长 %.3fs" % dur if dur else "",
+            dur,
             "  标记: " + "、".join(flags) if flags else ""))
     if st.get("revisions"):
         L.append("")
