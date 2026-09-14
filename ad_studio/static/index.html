@@ -78,6 +78,19 @@
     </div>
     <h2>描述卡</h2>
     <div id="descList"></div>
+
+    <h2>响度配平 <span id="lvHint" class="muted small">框选有效语音 → 拖增益/套建议 → A/B 循环试听 → 确认</span></h2>
+    <div class="lv-settings">
+      <label>目标电平 <input type="number" id="lvTarget" step="0.5" value="-20"> dBFS</label>
+      <label>峰值上限 <input type="number" id="lvCeiling" step="0.5" value="-1"> dBFS</label>
+      <label>相邻跳变阈值 <input type="number" id="lvMaxJump" step="0.5" value="3"> dB</label>
+      <label>有效语音≥ <input type="number" id="lvMinSpeech" step="0.1" value="0.3"> s</label>
+      <label>增益范围 <input type="number" id="lvMinGain" step="0.5" value="-14"> ~
+        <input type="number" id="lvMaxGain" step="0.5" value="15.6"> dB</label>
+      <button id="lvConfirmAll">全部确认</button>
+      <span id="lvStatus" class="muted small"></span>
+    </div>
+    <div id="levelingList" class="lv-list"></div>
   </section>
 
   <!-- 右:校审与修订 -->

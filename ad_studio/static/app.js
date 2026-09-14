@@ -2,13 +2,19 @@
 "use strict";
 
 // ---------------------------------------------------------------- 状态
+const DEFAULT_LV = { targetDb: -20, ceilingDb: -1, maxJumpDb: 3, minSpeech: 0.3,
+                     minGainDb: -14, maxGainDb: 15.6 };
 const S = {
   projectId: null,
   source: null,          // {name,duration,framerate,channels,peaks}
-  narrations: [],        // [{id,name,duration}]
+  narrations: [],        // [{id,name,duration,levels}]
   dialogue: [], scenes: [], descriptions: [], keysounds: [],
   placements: {},        // descId -> {narration_id, start, duck, gain, accepted}
   settings: { maxRate: 5.5, minGap: 0.4, duck_to: 0.35, duck_pad: 0.15 },
+  leveling: { settings: { ...DEFAULT_LV }, items: {} },  // 方案(ranges/gain/status)
+  lvReport: null,        // 后端最近一次配平报告
+  lvTimer: null,
+  abAudio: null,         // {descId, mode, nodes, start, a, b}
   issues: [],
   undoStack: [],
   pxPerSec: 60,
@@ -65,12 +71,21 @@ async function loadProject(pid) {
   S.descriptions = st.descriptions; S.keysounds = st.keysounds;
   S.placements = st.placements.placements || {};
   Object.assign(S.settings, st.placements.settings || {});
+  S.leveling = { settings: { ...DEFAULT_LV, ...(st.leveling.settings || {}) },
+                 items: st.leveling.items || {} };
+  S.lvReport = null; S.abAudio = null;
   S.issues = []; S.undoStack = []; S.loopRegion = null; S.playhead = 0;
   AudioEngine.reset();
   $("setRate").value = S.settings.maxRate;
   $("setMinGap").value = S.settings.minGap;
   $("setDuckTo").value = S.settings.duck_to;
+  for (const [k, id] of [["targetDb","lvTarget"],["ceilingDb","lvCeiling"],
+      ["maxJumpDb","lvMaxJump"],["minSpeech","lvMinSpeech"],
+      ["minGainDb","lvMinGain"],["maxGainDb","lvMaxGain"]])
+    $(id).value = S.leveling.settings[k];
   renderAssets(); renderDescList(); resizeCanvas(); runChecks(); renderRevisions(st.revisions);
+  renderLeveling();
+  ensureLevelCurves().then(computeLeveling);
   ["btnExportScript", "btnExportReplay"].forEach(id => $(id).disabled = false);
   $("btnExportMix").disabled = false;
 }
@@ -201,6 +216,7 @@ function renderDescList() {
       pushUndo();
       const pl = ensurePlacement(d);
       pl.narration_id = sel.value || null;
+      delete S.leveling.items[d.id];   // 改绑旁白: 旧选区/增益失效
       afterEdit();
     });
     const tc = div.querySelector(".tc");
@@ -228,15 +244,17 @@ function renderDescList() {
 
 function afterEdit() {
   renderDescList(); draw(); runChecks(); savePlacements(); AudioEngine.invalidateMix();
+  renderLeveling(); scheduleLeveling();
 }
 function pushUndo() {
-  S.undoStack.push(JSON.stringify(S.placements));
+  S.undoStack.push(JSON.stringify({ p: S.placements, l: S.leveling.items }));
   if (S.undoStack.length > 50) S.undoStack.shift();
 }
 $("btnUndo").addEventListener("click", () => {
   const s = S.undoStack.pop();
   if (!s) return;
-  S.placements = JSON.parse(s);
+  const u = JSON.parse(s);
+  S.placements = u.p; S.leveling.items = u.l || {};
   afterEdit();
 });
 
@@ -491,6 +509,20 @@ function runChecks() {
         solutions: ["autoMove", "accept"] });
     }
   }
+  // 7. 响度配平: 相邻描述响度跳变(警告, 非阻塞)
+  if (S.lvReport) {
+    for (const did of S.lvReport.order) {
+      const r = S.lvReport.items[did];
+      const jw = r.errors.find(e => e.code === "jump");
+      if (jw) {
+        issues.push({ type: "loudjump", descId: did, sev: "warn",
+          region: [r.start, r.start + r.duration],
+          title: `响度跳变 · ${r.jump.prev} → ${did}`,
+          detail: jw.msg + "。在响度配平中套建议增益可收敛到目标电平。",
+          solutions: ["goLeveling"] });
+      }
+    }
+  }
   S.issues = issues;
   renderIssues();
   draw();
@@ -512,7 +544,8 @@ function renderIssues() {
         <button class="loop ${loopOn ? "on" : ""}">${loopOn ? "■ 停止循环" : "🔁 循环试听"}</button>
       </div>`;
     const ops = div.querySelector(".ops");
-    const labels = { autoMove: "⇢ 移到空档", duck: "🔉 局部压低", abridge: "✂ 缩写稿", accept: "✔ 保留并记录" };
+    const labels = { autoMove: "⇢ 移到空档", duck: "🔉 局部压低", abridge: "✂ 缩写稿",
+                     accept: "✔ 保留并记录", goLeveling: "🎚 去响度配平" };
     for (const s of it.solutions) {
       const b = document.createElement("button");
       b.textContent = labels[s];
@@ -526,6 +559,7 @@ function renderIssues() {
     div.querySelector(".loop").addEventListener("click", () => {
       if (loopOn) { S.loopRegion = null; AudioEngine.stop(); }
       else {
+        stopLvPlay();
         const pad = 0.6;
         S.loopRegion = { a: Math.max(0, it.region[0] - pad), b: it.region[1] + pad, issueIdx: idx };
         AudioEngine.play($("playMode").value, S.loopRegion.a, S.loopRegion.b, true);
@@ -539,6 +573,15 @@ function renderIssues() {
 function applySolution(it, kind) {
   const d = S.descriptions.find(x => x.id === it.descId);
   if (!d) return;
+  if (kind === "goLeveling") {
+    const el = document.querySelector(`.lv-item[data-did="${it.descId}"]`);
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      el.classList.add("flash");
+      setTimeout(() => el.classList.remove("flash"), 1600);
+    }
+    return;
+  }
   pushUndo();
   const p = ensurePlacement(d);
   if (kind === "autoMove") {
@@ -555,7 +598,7 @@ function applySolution(it, kind) {
   }
   afterEdit();
   // 应用方案后自动回放该区域,便于比较
-  if (S.loopRegion) AudioEngine.play($("playMode").value, S.loopRegion.a, S.loopRegion.b, true);
+  if (S.loopRegion) { stopLvPlay(); AudioEngine.play($("playMode").value, S.loopRegion.a, S.loopRegion.b, true); }
 }
 
 // 在 [t, t+dur] 是否与对白/关键声/场景线/其他描述冲突
@@ -593,6 +636,412 @@ function findGap(d) {
   for (const t of sorted) if (fitsAt(d, t, dur)) return t;
   return null;
 }
+
+// ---------------------------------------------------------------- 响度配平
+function lvItem(did) {
+  if (!S.leveling.items[did])
+    S.leveling.items[did] = { ranges: null, gain: null, status: "pending" };
+  return S.leveling.items[did];
+}
+const lvRanges = (did) => {
+  const it = S.leveling.items[did];
+  const n = S.narrations.find(x => String(x.id) === String(S.placements[did]?.narration_id));
+  const d = n ? n.duration : 0;
+  return (it && it.ranges && it.ranges.length) ? it.ranges : [{ start: 0, end: d }];
+};
+
+async function ensureLevelCurves() {
+  if (!S.projectId) return;
+  const missing = S.narrations.some(n => !n.levels || !n.levels.peak || !n.levels.peak.length);
+  if (missing) {
+    await api(`/api/project/${S.projectId}/levelcurves`, { method: "POST" });
+    const st = await api(`/api/project/${S.projectId}/state`);
+    S.narrations = st.narrations;
+  }
+}
+
+function renderLeveling() {
+  const box = $("levelingList");
+  box.innerHTML = "";
+  const bound = S.descriptions.filter(d => S.placements[d.id] && S.placements[d.id].narration_id);
+  if (!bound.length) {
+    box.innerHTML = `<div class="muted small" style="padding:6px">绑定旁白后即可配平</div>`;
+    return;
+  }
+  for (const d of bound) {
+    const p = S.placements[d.id];
+    const n = S.narrations.find(x => String(x.id) === String(p.narration_id));
+    const it = lvItem(d.id);
+    const r = S.lvReport && S.lvReport.items[d.id];
+    const div = document.createElement("div");
+    div.className = "lv-item" + (it.status === "confirmed" ? " confirmed" : "");
+    div.dataset.did = d.id;
+    const bads = r ? r.errors.filter(e => e.sev === "bad") : [];
+    const warns = r ? r.errors.filter(e => e.sev === "warn") : [];
+    const appliedDb = it.gain != null ? 20 * Math.log10(it.gain) : 0;
+    const gainDb = appliedDb;
+    const badge = it.status === "confirmed"
+      ? `<span class="badge ok">已确认 ${it.accepted_reason ? "·人工保留" : ""}</span>`
+      : (bads.length ? `<span class="badge bad">待处理 · ${bads.length} 个阻塞</span>`
+                     : `<span class="badge warn">待处理</span>`);
+    div.innerHTML = `
+      <div class="lv-head">
+        <b>${d.id}</b> ${n.name}
+        <span class="mono small muted">${n.duration.toFixed(2)}s @ ${fmtTC(p.start)}</span>
+        ${badge}
+      </div>
+      <canvas class="lv-canvas" height="110"></canvas>
+      <div class="lv-metrics mono small">
+        ${r ? `<span>有效语音 <b>${r.selDuration.toFixed(2)}s</b></span>
+          <span>RMS <b>${r.rmsDb.toFixed(1)}</b> dBFS</span>
+          <span>片段峰 <b>${r.peakDb.toFixed(1)}</b></span>
+          <span>混音峰 <b class="${r.mixPeakDb != null && r.mixPeakDb > S.leveling.settings.ceilingDb ? "bad" : "ok"}">${r.mixPeakDb != null ? r.mixPeakDb.toFixed(1) : "—"}</b></span>
+          <span>建议 <b>${r.suggestGainDb >= 0 ? "+" : ""}${r.suggestGainDb.toFixed(1)}</b> dB${r.suggestClamped ? " <i class='warn'>(受限)</i>" : ""}</span>
+          <span>${r.jump ? `相邻跳变 <b class="${Math.abs(r.jump.db) > S.leveling.settings.maxJumpDb ? "bad" : "ok"}">${r.jump.db >= 0 ? "+" : ""}${r.jump.db.toFixed(1)}</b> dB` : ""}</span>`
+          : `<span class="muted">计算中…</span>`}
+      </div>
+      <div class="lv-errs">${[...bads, ...warns].map(e =>
+        `<div class="lv-err ${e.sev === "bad" ? "bad" : "warn"}">${e.code === "jump" ? "" : "⛔ "}${e.msg}</div>`).join("")}</div>
+      <div class="lv-controls">
+        <label class="grow">增益
+          <input type="range" class="lv-gain" min="${S.leveling.settings.minGainDb}"
+                 max="${S.leveling.settings.maxGainDb}" step="0.1" value="${gainDb.toFixed(1)}">
+          <input type="number" class="lv-gain-num mono" step="0.1" value="${gainDb.toFixed(1)}"> dB
+        </label>
+        <button class="lv-suggest">套建议</button>
+        <button class="lv-ab-orig">A 原版</button>
+        <button class="lv-ab-new">B 调整版</button>
+        <button class="lv-stop">■</button>
+        <button class="lv-range-all">整段</button>
+        <button class="lv-range-clear">清选区</button>
+        <button class="lv-confirm">${it.status === "confirmed" ? "重新确认" : "确认"}</button>
+      </div>
+      ${bads.length ? `<input class="lv-keep small" placeholder="人工保留理由(阻塞错误下确认必填, 将写入修订)">` : ""}`;
+    box.appendChild(div);
+
+    const canvas = div.querySelector(".lv-canvas");
+    drawLvCurve(canvas, d.id, n);
+    canvas.addEventListener("mousedown", (e) => lvDragStart(e, canvas, d.id, n));
+    const gainSlider = div.querySelector(".lv-gain");
+    gainSlider.addEventListener("input", (e) => {
+      // 拖动中: 只写增益与数字框, 不重渲染(避免拖手中断); 重算延后到 change
+      const it2 = lvItem(d.id);
+      it2.gain = Math.pow(10, (+e.target.value) / 20);
+      it2.status = "pending";
+      div.querySelector(".lv-gain-num").value = e.target.value;
+    });
+    gainSlider.addEventListener("change", () => {
+      renderLeveling();
+      scheduleLeveling();
+    });
+    div.querySelector(".lv-gain-num").addEventListener("change", (e) => {
+      const it2 = lvItem(d.id);
+      const v = Math.max(S.leveling.settings.minGainDb,
+                        Math.min(S.leveling.settings.maxGainDb, +e.target.value || 0));
+      it2.gain = Math.pow(10, v / 20);
+      it2.status = "pending";
+      e.target.value = v.toFixed(1);
+      div.querySelector(".lv-gain").value = v;
+      renderLeveling();
+      scheduleLeveling();
+    });
+    div.querySelector(".lv-suggest").addEventListener("click", () => {
+      const rr = S.lvReport && S.lvReport.items[d.id];
+      if (!rr) return;
+      const it2 = lvItem(d.id);
+      it2.gain = rr.suggestGain; it2.status = "pending";
+      renderLeveling();
+      scheduleLeveling();
+    });
+    div.querySelector(".lv-ab-orig").addEventListener("click", () => lvPlay(d.id, "orig"));
+    div.querySelector(".lv-ab-new").addEventListener("click", () => lvPlay(d.id, "new"));
+    div.querySelector(".lv-stop").addEventListener("click", stopLvPlay);
+    div.querySelector(".lv-range-all").addEventListener("click", () => {
+      lvItem(d.id).ranges = [{ start: 0, end: n.duration }];
+      lvItem(d.id).status = "pending";
+      renderLeveling(); scheduleLeveling();
+    });
+    div.querySelector(".lv-range-clear").addEventListener("click", () => {
+      lvItem(d.id).ranges = [];
+      lvItem(d.id).status = "pending";
+      renderLeveling(); scheduleLeveling();
+    });
+    div.querySelector(".lv-confirm").addEventListener("click", () => lvConfirm(d.id, div));
+  }
+  syncLvAbButtons();
+}
+
+// ---- 曲线绘制
+function drawLvCurve(canvas, did, narr, draftRanges) {
+  const parentW = canvas.parentElement.clientWidth - 28;
+  const w = Math.max(320, parentW);
+  const dpr = window.devicePixelRatio || 1;
+  const h = 110;
+  canvas.style.width = w + "px";
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const g = canvas.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const padL = 40, padR = 8, padT = 8, padB = 14;
+  const pw = w - padL - padR, ph = h - padT - padB;
+  const yOfDb = (db) => padT + (-db / 60) * ph;   // 0dB 顶, -60dB 底
+  // 网格
+  g.fillStyle = "#0d1015"; g.fillRect(padL, padT, pw, ph);
+  g.strokeStyle = "#222a36"; g.fillStyle = "#5b6878"; g.font = "9px monospace";
+  for (const db of [0, -12, -24, -36, -48, -60]) {
+    const y = yOfDb(db);
+    g.beginPath(); g.moveTo(padL, y); g.lineTo(padL + pw, y); g.stroke();
+    g.fillText(db + "", 4, y + 3);
+  }
+  // 目标/上限线
+  const stg = S.leveling.settings;
+  g.setLineDash([4, 3]);
+  g.strokeStyle = "#5fd68a"; g.fillStyle = "#5fd68a";
+  g.beginPath(); g.moveTo(padL, yOfDb(stg.targetDb)); g.lineTo(padL + pw, yOfDb(stg.targetDb)); g.stroke();
+  g.fillText("目标", padL + pw - 30, yOfDb(stg.targetDb) - 2);
+  g.strokeStyle = "#ff6b6b";
+  g.beginPath(); g.moveTo(padL, yOfDb(stg.ceilingDb)); g.lineTo(padL + pw, yOfDb(stg.ceilingDb)); g.stroke();
+  g.fillStyle = "#ff6b6b"; g.fillText("上限", padL + 4, yOfDb(stg.ceilingDb) - 2);
+  g.setLineDash([]);
+  // 选区背景
+  const xOfT = (t) => padL + (t / narr.duration) * pw;
+  const shownRanges = draftRanges || lvRanges(did);
+  for (const rg of shownRanges) {
+    g.fillStyle = draftRanges ? "rgba(255,184,77,.22)" : "rgba(77,163,255,.16)";
+    g.fillRect(xOfT(rg.start), padT, (rg.end - rg.start) / narr.duration * pw, ph);
+  }
+  // 曲线
+  const lv2 = narr.levels;
+  if (lv2 && lv2.t.length) {
+    const nPts = lv2.t.length;
+    g.lineWidth = 1;
+    g.strokeStyle = "#8a6bd6"; g.beginPath();
+    lv2.peak.forEach((db, i) => {
+      const x = padL + (i / (nPts - 1)) * pw, y = yOfDb(db);
+      i ? g.lineTo(x, y) : g.moveTo(x, y);
+    });
+    g.stroke();
+    g.strokeStyle = "#ffd166"; g.beginPath();
+    lv2.rms.forEach((db, i) => {
+      const x = padL + (i / (nPts - 1)) * pw, y = yOfDb(db);
+      i ? g.lineTo(x, y) : g.moveTo(x, y);
+    });
+    g.stroke();
+  } else {
+    g.fillStyle = "#7f8ca0"; g.fillText("无曲线数据", padL + 10, padT + ph / 2);
+  }
+  // 时间刻度
+  g.fillStyle = "#5b6878";
+  const step = narr.duration > 2.5 ? 1 : 0.5;
+  for (let t = 0; t <= narr.duration + 1e-6; t += step)
+    g.fillText(t.toFixed(1), xOfT(t) - 6, h - 3);
+  // A/B 试听窗
+  if (S.abAudio && S.abAudio.descId === did) {
+    const rg = S.abAudio.region;
+    g.strokeStyle = S.abAudio.mode === "orig" ? "#9fd0ff" : "#ffb84d";
+    g.lineWidth = 2;
+    g.strokeRect(xOfT(rg.start), padT, (rg.end - rg.start) / narr.duration * pw, ph);
+    g.lineWidth = 1;
+  }
+}
+
+// ---- 框选有效语音(横向拖动选区; 点击空白开新区, 点中现有区则拖动边界移动)
+let lvDrag = null;
+function lvCanvasPos(e, canvas, narr) {
+  const r = canvas.getBoundingClientRect();
+  const x = e.clientX - r.left;
+  const padL = 40, padR = 8;
+  const pw = canvas.clientWidth - padL - padR;
+  return Math.max(0, Math.min(narr.duration, (x - padL) / pw * narr.duration));
+}
+function lvDragStart(e, canvas, did, narr) {
+  const t = lvCanvasPos(e, canvas, narr);
+  const ranges = lvRanges(did);
+  const hit = ranges.find(rg => t >= rg.start && t <= rg.end);
+  if (e.shiftKey || !hit) {
+    lvDrag = { did, canvas, narr, start: t, kind: "new", base: null,
+               snap: ranges.map(r => ({ ...r })), draft: null };
+  } else {
+    const edge = Math.abs(t - hit.start) < 0.08 * narr.duration ? "start"
+               : Math.abs(t - hit.end) < 0.08 * narr.duration ? "end" : "move";
+    lvDrag = { did, canvas, narr, kind: edge, base: { ...hit },
+               snap: ranges.map(r => ({ ...r })), draft: null };
+  }
+  window.addEventListener("mousemove", lvDragMove);
+  window.addEventListener("mouseup", lvDragEnd);
+}
+function lvDragMove(e) {
+  if (!lvDrag) return;
+  const t = lvCanvasPos(e, lvDrag.canvas, lvDrag.narr);
+  const draft = lvDrag.snap.map(r => ({ ...r }));
+  if (lvDrag.kind === "new") {
+    draft.push({ start: Math.min(lvDrag.start, t), end: Math.max(lvDrag.start, t) });
+  } else {
+    const b = lvDrag.base;
+    const cur = draft.find(rg => Math.abs(rg.start - b.start) < 1e-9 && Math.abs(rg.end - b.end) < 1e-9);
+    if (lvDrag.kind === "start") cur.start = Math.min(t, cur.end - 0.02);
+    if (lvDrag.kind === "end") cur.end = Math.max(t, cur.start + 0.02);
+    if (lvDrag.kind === "move") {
+      const dt = t - (b.start + (b.end - b.start) / 2);
+      cur.start = Math.max(0, Math.min(lvDrag.narr.duration - (b.end - b.start), b.start + dt));
+      cur.end = cur.start + (b.end - b.start);
+    }
+  }
+  lvDrag.draft = draft;
+  drawLvCurve(lvDrag.canvas, lvDrag.did, lvDrag.narr, draft);
+}
+function lvDragEnd() {
+  if (!lvDrag) return;
+  const it = lvItem(lvDrag.did);
+  let rs = (lvDrag.draft || lvDrag.snap).map(r => ({ start: +r.start.toFixed(3), end: +r.end.toFixed(3) }))
+    .filter(r => r.end - r.start >= 0.02).sort((a, b) => a.start - b.start);
+  // 合并重叠选区
+  const merged = [];
+  for (const r of rs) {
+    const last = merged[merged.length - 1];
+    if (last && r.start <= last.end) last.end = Math.max(last.end, r.end);
+    else merged.push(r);
+  }
+  it.ranges = merged;
+  it.status = "pending";
+  lvDrag = null;
+  window.removeEventListener("mousemove", lvDragMove);
+  window.removeEventListener("mouseup", lvDragEnd);
+  renderLeveling();
+  scheduleLeveling();
+}
+
+// ---- 保存并计算(防抖)
+async function saveLevelingPlan() {
+  if (!S.projectId || !S.source) return;
+  const plan = { settings: S.leveling.settings, items: S.leveling.items };
+  return api(`/api/project/${S.projectId}/leveling`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(plan),
+  });
+}
+async function computeLeveling() {
+  if (!S.projectId || !S.source) return;
+  $("lvStatus").textContent = "计算中…";
+  try {
+    const rep = await saveLevelingPlan();
+    S.lvReport = rep;
+    renderLeveling(); runChecks(); AudioEngine.invalidateMix();
+    const nb = rep.blocked.length;
+    $("lvStatus").textContent = nb ? `${nb} 段阻塞待处理` : "✓ 全部可确认";
+    $("lvStatus").className = nb ? "small bad" : "small ok";
+  } catch (e) {
+    $("lvStatus").textContent = e.message;
+  }
+}
+function scheduleLeveling() {
+  clearTimeout(S.lvTimer);
+  S.lvTimer = setTimeout(computeLeveling, 300);
+}
+
+// ---- 确认
+async function lvConfirm(did, div) {
+  const reasonInput = div.querySelector(".lv-keep");
+  const reason = reasonInput ? reasonInput.value.trim() : "";
+  try {
+    await saveLevelingPlan();
+    const r = await api(`/api/project/${S.projectId}/levelconfirm`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ desc_id: did, accepted_reason: reason }),
+    });
+    if (!r.ok) {
+      const s = r.skipped[0];
+      toast("无法确认:" + (s ? s.reason : "未知") + (s && s.errors ? "(" + s.errors.map(e => e.code).join(",") + ")" : ""));
+    }
+    const st = await api(`/api/project/${S.projectId}/state`);
+    S.leveling.items = st.leveling.items || {};
+    S.lvReport = r.report;
+    renderRevisions(st.revisions);
+    renderLeveling(); runChecks(); AudioEngine.invalidateMix();
+    if (r.ok) toast(`已确认 ${r.confirmed.join(",")}`);
+  } catch (e) { toast(e.message); }
+}
+$("lvConfirmAll").addEventListener("click", async () => {
+  stopLvPlay();
+  // 先保存当前编辑并重算, 再全部确认
+  S.lvReport = await saveLevelingPlan();
+  renderLeveling(); runChecks();
+  const blocked = S.lvReport.blocked;
+  let reason = "";
+  if (blocked.length) {
+    reason = prompt(`以下片段存在阻塞错误:\n${blocked.join(", ")}\n\n填写人工保留理由后将一并确认(取消则跳过这些片段):`);
+    if (reason === null) { toast("已取消"); return; }
+  }
+  const r = await api(`/api/project/${S.projectId}/levelconfirm`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ accepted_reason: reason }),
+  });
+  const st = await api(`/api/project/${S.projectId}/state`);
+  S.leveling.items = st.leveling.items || {};
+  S.lvReport = r.report;
+  renderRevisions(st.revisions);
+  renderLeveling(); runChecks(); AudioEngine.invalidateMix();
+  const okN = r.confirmed.length, skipN = r.skipped.length;
+  toast(`确认 ${okN} 段${skipN ? `,跳过 ${skipN} 段` : ""}`);
+});
+
+// ---- A/B 循环试听(Web Audio)
+function syncLvAbButtons() {
+  document.querySelectorAll(".lv-item").forEach(div => {
+    const on = S.abAudio && S.abAudio.descId === div.dataset.did;
+    div.querySelector(".lv-ab-orig").classList.toggle("on", on && S.abAudio.mode === "orig");
+    div.querySelector(".lv-ab-new").classList.toggle("on", on && S.abAudio.mode === "new");
+  });
+}
+function stopLvPlay() {
+  if (!S.abAudio) return;
+  const did = S.abAudio.descId;
+  for (const n of S.abAudio.nodes) { try { n.stop(); } catch (e) {} try { n.disconnect(); } catch (e) {} }
+  S.abAudio = null;
+  syncLvAbButtons();
+  drawLvCurveForDid(did);
+}
+async function lvPlay(did, mode) {
+  stopLvPlay();
+  const p = S.placements[did];
+  const nid = p.narration_id;
+  const buf = await AudioEngine.loadNarr(nid);
+  const it = S.leveling.items[did] || {};
+  const report = S.lvReport && S.lvReport.items[did];
+  let ranges = lvRanges(did);
+  if (!ranges.length) ranges = [{ start: 0, end: buf.duration }];
+  const gain = mode === "new"
+    ? (it.gain != null ? it.gain : report ? report.suggestGain : 1.0)
+    : 1.0;
+  const a = Math.min(...ranges.map(r => r.start));
+  const b = Math.max(...ranges.map(r => r.end));
+  const ctx = AudioEngine.ensureCtx();
+  if (ctx.state === "suspended") await ctx.resume();
+  const nodes = [];
+  const gn = ctx.createGain(); gn.gain.value = gain; gn.connect(ctx.destination);
+  const src = ctx.createBufferSource();
+  src.buffer = buf; src.loop = true; src.loopStart = a; src.loopEnd = b;
+  src.connect(gn); src.start(0, a);
+  nodes.push(src, gn);
+  S.abAudio = { descId: did, mode, nodes, region: { start: a, end: b } };
+  syncLvAbButtons();
+  drawLvCurveForDid(did);
+}
+function drawLvCurveForDid(did) {
+  const div = document.querySelector(`.lv-item[data-did="${did}"]`);
+  if (!div) return;
+  const d = S.descriptions.find(x => x.id === did);
+  const n = S.narrations.find(x => String(x.id) === String(S.placements[did].narration_id));
+  drawLvCurve(div.querySelector(".lv-canvas"), did, n);
+}
+
+// ---- 配平参数
+[["lvTarget","targetDb"],["lvCeiling","ceilingDb"],["lvMaxJump","maxJumpDb"],
+ ["lvMinSpeech","minSpeech"],["lvMinGain","minGainDb"],["lvMaxGain","maxGainDb"]]
+.forEach(([id, key]) => $(id).addEventListener("change", () => {
+  S.leveling.settings[key] = +$(id).value;
+  renderLeveling();
+  scheduleLeveling();
+}));
 
 // ---------------------------------------------------------------- 播放引擎(Web Audio)
 const AudioEngine = {
@@ -652,7 +1101,7 @@ const AudioEngine = {
     for (const d of S.descriptions) {
       const p = S.placements[d.id];
       if (!p || !p.narration_id) continue;
-      jobs.push({ p, nb: await this.effectiveNarr(d) });
+      jobs.push({ p, _did: d.id, nb: await this.effectiveNarr(d) });
     }
     const env = new Float32Array(n).fill(1);
     for (const { p, nb } of jobs) {
@@ -673,8 +1122,10 @@ const AudioEngine = {
       const od = out.getChannelData(c);
       for (let i = 0; i < n; i++) od[i] = sd[i] * env[i];
     }
-    for (const { p, nb } of jobs) {
-      const gain = p.gain == null ? 1 : p.gain;
+    for (const { p, _did, nb } of jobs) {
+      let gain = p.gain == null ? 1 : p.gain;
+      const lvi = S.leveling.items[_did];
+      if (lvi && lvi.status === "confirmed" && lvi.gain != null) gain = lvi.gain;
       const startF = Math.round(p.start * sr);
       for (let c = 0; c < nch; c++) {
         const nd = nb.getChannelData(Math.min(c, nb.numberOfChannels - 1));
@@ -762,11 +1213,12 @@ const AudioEngine = {
 
 $("btnPlay").addEventListener("click", () => {
   if (!S.source) return;
+  stopLvPlay();
   S.loopRegion = null;
   renderIssues(); draw();
   AudioEngine.play($("playMode").value, S.playhead);
 });
-$("btnStop").addEventListener("click", () => { AudioEngine.stop(); S.loopRegion = null; renderIssues(); draw(); });
+$("btnStop").addEventListener("click", () => { AudioEngine.stop(); S.loopRegion = null; stopLvPlay(); renderIssues(); draw(); });
 
 // ---------------------------------------------------------------- 混音渲染与导出
 $("btnRenderMix").addEventListener("click", async () => {
@@ -774,7 +1226,9 @@ $("btnRenderMix").addEventListener("click", async () => {
   await savePlacements();
   toast("渲染中…");
   const r = await api(`/api/project/${S.projectId}/mix`, { method: "POST" });
-  toast(`混音完成 ${r.duration.toFixed(2)}s,可导出`);
+  toast(r.clip
+    ? `⚠ 混音含 ${r.clip.frames} 个削波采样,峰值 ${r.clip.peak_db} dBFS,首次 ${fmtTC(r.clip.first_t)}`
+    : `混音完成 ${r.duration.toFixed(2)}s,可导出`);
 });
 $("btnExportScript").addEventListener("click", async () => {
   await savePlacements();
