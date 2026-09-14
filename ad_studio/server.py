@@ -587,6 +587,27 @@ def leveling_report(st, plan, src, src_nch, src_fr, narr_clips):
             blocked.append(did)
     return {"settings": settings, "items": results, "order": order, "blocked": blocked}
 
+def sanitize_leveling_plan(plan, report):
+    """
+    按实时校审报告纠正方案状态(纵深防御, 不相信库里的 confirmed 标记):
+    - 存在 bad 阻塞错误(有效语音不足/通道不一致/增益越界/混音削波)的片段强制 pending;
+    - 未绑定旁白(不在报告里)的片段同样强制 pending;
+    - 仅无阻塞且 status=confirmed 的片段保留 confirmed, 其增益才会进入确认版混音/导出。
+    返回全量 plan(items 保留, 仅纠正 status), 可直接喂给 render_mix/build_script/复演导出。
+    """
+    safe = {"settings": (plan or {}).get("settings", default_level_settings()), "items": {}}
+    for did, item in ((plan or {}).get("items") or {}).items():
+        it = dict(item)
+        r = report["items"].get(did)
+        bad = r is not None and any(e["sev"] == "bad" for e in r["errors"])
+        if bad or r is None:
+            it["status"] = "pending"
+        # 非 confirmed 不允许残留确认态; confirmed 仅在无阻塞时保留
+        if it.get("status") != "confirmed":
+            it["status"] = "pending"
+        safe["items"][did] = it
+    return safe
+
 # ---------------------------------------------------------------- 时码解析
 
 def parse_tc(v):
@@ -987,18 +1008,25 @@ def route(environ, start_response):
             plist = [dict(v, desc_id=k) for k, v in pdata.get("placements", {}).items()
                      if v.get("narration_id")]
             desc_texts = {d["id"]: d.get("text", "") for d in st["descriptions"]}
+            # 确认版增益出口前再校验: 阻塞片段强制 pending, 其增益不进混音 WAV
+            stored_lv = st.get("leveling") or {"settings": default_level_settings(), "items": {}}
+            lv_report = leveling_report(st, stored_lv, src, nch, fr, narr_clips)
+            eff_lv = sanitize_leveling_plan(stored_lv, lv_report)
             mixed, clipinfo, _peak = render_mix(
                 src, nch, fr, plist, narr_clips, pdata.get("settings", {}),
-                desc_texts, st.get("leveling"))
+                desc_texts, eff_lv)
             wav_bytes = write_wav(mixed, nch, fr)
             with open(os.path.join(proj_dir(pid), "mix.wav"), "wb") as f:
                 f.write(wav_bytes)
             return json_resp(start_response, {"ok": True, "duration": (len(mixed) // nch) / fr,
                                               "clip": clipinfo,
+                                              "confirmedLeveled": [did for did, it in eff_lv["items"].items()
+                                                                   if it.get("status") == "confirmed"],
                                               "url": "/api/project/%d/file?which=mix" % pid})
 
         if sub == "leveling" and method == "POST":
-            # 保存方案 + 计算各片段电平/建议增益/混音峰值/跳变, 返回报告(不自动确认)
+            # 保存方案 + 计算各片段电平/建议增益/混音峰值/跳变, 返回报告。
+            # 阻塞片段一律强制 pending: 人工理由不改变阻塞状态, 其增益永不进确认版。
             body = json.loads(read_body(environ) or b"{}")
             plan = {"settings": body.get("settings") or default_level_settings(),
                     "items": body.get("items") or {}}
@@ -1006,12 +1034,15 @@ def route(environ, start_response):
             if not st or not st["source"]:
                 return err(start_response, "请先载入正片 WAV")
             src, nch, fr, narr_clips = load_engine_audio(pid)
-            save_leveling(pid, plan)
             report = leveling_report(st, plan, src, nch, fr, narr_clips)
+            safe_plan = sanitize_leveling_plan(plan, report)
+            save_leveling(pid, safe_plan)
             return json_resp(start_response, report)
 
         if sub == "levelconfirm" and method == "POST":
-            # 确认单段或全部: 阻塞错误必须附「人工保留理由」; 确认参数写入修订
+            # 确认单段或全部。硬规则: 有效语音不足/通道不一致/增益越界/混音削波时,
+            # 无论是否填写人工理由, 片段都保持 pending, 增益不进确认版混音/脚本/复演。
+            # 人工理由可以写入修订与方案备注, 但不改变阻塞状态。
             body = json.loads(read_body(environ) or b"{}")
             target_did = body.get("desc_id")
             keep_reason = (body.get("accepted_reason") or "").strip()
@@ -1023,61 +1054,80 @@ def route(environ, start_response):
             report = leveling_report(st, plan, src, nch, fr, narr_clips)
             desc_by_id = {d["id"]: d for d in st["descriptions"]}
             to_confirm = [target_did] if target_did else report["order"]
-            confirmed, skipped = [], []
+            confirmed, blocked, unbound = [], [], []
+
+            def add_revision(did, r, gain, reason, blocked_flag):
+                ranges_txt = ", ".join("%s–%s" % (fmt_tc(q["start"]), fmt_tc(q["end"]))
+                                       for q in r["ranges"])
+                snap = {"kind": "leveling_pending" if blocked_flag else "leveling",
+                        "desc_id": did, "ranges": r["ranges"], "rangeText": ranges_txt,
+                        "rmsDb": r["rmsDb"], "gain": gain,
+                        "gainDb": _gain_db(gain) if gain is not None else None,
+                        "mixPeakDb": r["mixPeakDb"],
+                        "blocked": blocked_flag,
+                        "blockedErrors": [e["code"] for e in r["errors"] if e["sev"] == "bad"],
+                        "accepted_reason": reason, "settings": plan["settings"]}
+                if blocked_flag:
+                    summary = "响度配平保持待处理 %s [%s] 片段 %s" % (did, fmt_tc(r["start"]), r["name"])
+                else:
+                    summary = "响度配平确认 %s [%s] 片段 %s" % (did, fmt_tc(r["start"]), r["name"])
+                conn2 = db()
+                conn2.execute("INSERT INTO revisions(project_id,created,summary,rationale,snapshot_json) "
+                              "VALUES(?,?,?,?,?)",
+                              (pid, time.time(), summary, reason,
+                               json.dumps(snap, ensure_ascii=False)))
+                conn2.commit(); conn2.close()
+
             for did in to_confirm:
                 r = report["items"].get(did)
                 if not r:
-                    skipped.append({"desc_id": did, "reason": "未绑定旁白"})
+                    unbound.append({"desc_id": did, "reason": "未绑定旁白"})
                     continue
                 bad = [e for e in r["errors"] if e["sev"] == "bad"]
-                if bad and not keep_reason:
-                    skipped.append({"desc_id": did, "reason": "存在阻塞错误且未填人工保留理由",
-                                    "errors": bad})
-                    continue
                 item = plan["items"].get(did) or {}
-                if r["gain"] is None:
-                    item["gain"] = r["suggestGain"]
-                item["status"] = "confirmed"
                 item["ranges"] = r["ranges"]
+                gain = r["gain"] if r["gain"] is not None else r["suggestGain"]
+                if bad:
+                    # 阻塞: 始终 pending; 有理由则把草稿增益与理由留痕, 但不确认
+                    item["status"] = "pending"
+                    if keep_reason:
+                        item["accepted_reason"] = keep_reason
+                        add_revision(did, r, gain, keep_reason, True)
+                    plan["items"][did] = item
+                    blocked.append({"desc_id": did, "reason": "存在阻塞错误,片段保持待处理",
+                                    "errors": [e["msg"] for e in bad],
+                                    "codes": [e["code"] for e in bad],
+                                    "reasonLogged": bool(keep_reason)})
+                    continue
+                # 无阻塞: 确认; 理由仅作人工备注, 不影响状态
+                item["gain"] = gain
+                item["status"] = "confirmed"
                 if keep_reason:
                     item["accepted_reason"] = keep_reason
+                elif "accepted_reason" in item:
+                    del item["accepted_reason"]
                 plan["items"][did] = item
                 confirmed.append(did)
-            if not confirmed:
-                return json_resp(start_response, {"ok": False, "confirmed": [], "skipped": skipped,
-                                                  "report": report})
-            save_leveling(pid, plan)
-            # 修订留痕: 有效区间、增益、人工保留理由入快照
-            for did in confirmed:
-                r = report["items"][did]
-                d = desc_by_id.get(did)
-                gain = plan["items"][did]["gain"]
-                ranges_txt = ", ".join("%s–%s" % (fmt_tc(q["start"]), fmt_tc(q["end"]))
-                                       for q in r["ranges"])
-                reason = keep_reason or ("配平至目标 %.1f dBFS,混音峰值 %.1f dBFS" % (
-                    plan["settings"]["targetDb"],
-                    r["mixPeakDb"] if r["mixPeakDb"] is not None else 0.0))
-                conn = db()
-                conn.execute("INSERT INTO revisions(project_id,created,summary,rationale,snapshot_json) "
-                             "VALUES(?,?,?,?,?)",
-                             (pid, time.time(),
-                              "响度配平确认 %s [%s] 片段 %s" % (
-                                  did, fmt_tc(r["start"]), r["name"]),
-                              reason,
-                              json.dumps({"kind": "leveling", "desc_id": did,
-                                          "ranges": r["ranges"], "rangeText": ranges_txt,
-                                          "rmsDb": r["rmsDb"], "gain": gain,
-                                          "gainDb": _gain_db(gain),
-                                          "mixPeakDb": r["mixPeakDb"],
-                                          "accepted_reason": keep_reason,
-                                          "settings": plan["settings"]}, ensure_ascii=False)))
-                conn.commit()
-                conn.close()
-            # 用已保存方案重算一次报告返回
+                add_revision(did, r, gain, keep_reason or
+                             ("配平至目标 %.1f dBFS,混音峰值 %.1f dBFS" % (
+                                 plan["settings"]["targetDb"],
+                                 r["mixPeakDb"] if r["mixPeakDb"] is not None else 0.0)), False)
+
+            if confirmed:
+                safe_plan = sanitize_leveling_plan(plan, report)
+                save_leveling(pid, safe_plan)
+            # 即使没有 confirmed(全部被阻塞), 理由也已写修订; plan 中的 pending 备注回存
+            elif any(b["reasonLogged"] for b in blocked):
+                save_leveling(pid, plan)
             st2 = get_state(pid)
-            report2 = leveling_report(st2, plan, src, nch, fr, narr_clips)
-            return json_resp(start_response, {"ok": True, "confirmed": confirmed,
-                                              "skipped": skipped, "report": report2,
+            report2 = leveling_report(st2, st2.get("leveling") or plan,
+                                       src, nch, fr, narr_clips)
+            return json_resp(start_response, {"ok": bool(confirmed),
+                                              "confirmed": confirmed,
+                                              "blocked": blocked,
+                                              "unbound": unbound,
+                                              "skipped": blocked + unbound,
+                                              "report": report2,
                                               "revisions": st2["revisions"]})
 
         if sub == "file" and method == "GET":
@@ -1127,8 +1177,23 @@ def route(environ, start_response):
             st = get_state(pid)
             if not st:
                 return err(start_response, "项目不存在", "404 Not Found")
+            # 导出前统一实时校审: 阻塞片段不得在脚本/复演里以 confirmed 与增益出现
+            stored_lv = st.get("leveling") or {"settings": default_level_settings(), "items": {}}
+            eff_lv = stored_lv
+            if st.get("source"):
+                try:
+                    src2, nc2, fr2, clips2 = load_engine_audio(pid)
+                    lv_report = leveling_report(st, stored_lv, src2, nc2, fr2, clips2)
+                    eff_lv = sanitize_leveling_plan(stored_lv, lv_report)
+                    eff_lv["blocked"] = {did: [e["code"] for e in r["errors"] if e["sev"] == "bad"]
+                                         for did, r in lv_report["items"].items()
+                                         if any(e["sev"] == "bad" for e in r["errors"])}
+                except FileNotFoundError:
+                    eff_lv = sanitize_leveling_plan(stored_lv, {"items": {}})
+            else:
+                eff_lv = sanitize_leveling_plan(stored_lv, {"items": {}})
             if what == "script":
-                text = build_script(st)
+                text = build_script(dict(st, leveling=eff_lv))
                 body = text.encode("utf-8")
                 start_response("200 OK", [
                     ("Content-Type", "text/plain; charset=utf-8"),
@@ -1140,8 +1205,7 @@ def route(environ, start_response):
                           "narrations": st["narrations"], "dialogue": st["dialogue"],
                           "scenes": st["scenes"], "descriptions": st["descriptions"],
                           "keysounds": st["keysounds"], "placements": st["placements"],
-                          "leveling": st.get("leveling",
-                                            {"settings": default_level_settings(), "items": {}}),
+                          "leveling": eff_lv,
                           "exported_at": time.time()}
                 body = json.dumps(replay, ensure_ascii=False, indent=2).encode("utf-8")
                 start_response("200 OK", [
@@ -1230,7 +1294,13 @@ def build_script(st):
                     _gain_db(float(lv.get("gain", 1.0))), float(lv.get("gain", 1.0)), rng,
                     "  人工保留: " + lv["accepted_reason"] if lv.get("accepted_reason") else ""))
             else:
-                L.append("    响度配平: 待处理(未确认,不参与混音/导出)")
+                codes = (leveling.get("blocked") or {}).get(d["id"])
+                note = "待处理(未确认,增益不参与混音/导出)"
+                if codes:
+                    note += " 阻塞: " + "、".join(codes)
+                if lv.get("accepted_reason"):
+                    note += " 人工留痕(不改状态): " + lv["accepted_reason"]
+                L.append("    响度配平: " + note)
     if st.get("revisions"):
         L.append("")
         L.append("# 修订记录")

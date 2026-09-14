@@ -716,7 +716,7 @@ function renderLeveling() {
         <button class="lv-range-clear">清选区</button>
         <button class="lv-confirm">${it.status === "confirmed" ? "重新确认" : "确认"}</button>
       </div>
-      ${bads.length ? `<input class="lv-keep small" placeholder="人工保留理由(阻塞错误下确认必填, 将写入修订)">` : ""}`;
+      ${bads.length ? `<input class="lv-keep small" placeholder="人工留痕理由(仅写入修订, 不改变阻塞状态, 片段仍保持待处理)">` : ""}`;
     box.appendChild(div);
 
     const canvas = div.querySelector(".lv-canvas");
@@ -948,40 +948,37 @@ async function lvConfirm(did, div) {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ desc_id: did, accepted_reason: reason }),
     });
-    if (!r.ok) {
-      const s = r.skipped[0];
-      toast("无法确认:" + (s ? s.reason : "未知") + (s && s.errors ? "(" + s.errors.map(e => e.code).join(",") + ")" : ""));
-    }
     const st = await api(`/api/project/${S.projectId}/state`);
     S.leveling.items = st.leveling.items || {};
     S.lvReport = r.report;
     renderRevisions(st.revisions);
     renderLeveling(); runChecks(); AudioEngine.invalidateMix();
-    if (r.ok) toast(`已确认 ${r.confirmed.join(",")}`);
+    if (r.confirmed.includes(did)) {
+      toast(`已确认 ${did}`);
+    } else {
+      const b = (r.blocked || []).find(x => x.desc_id === did);
+      toast(b
+        ? `${did} 阻塞待处理,保持 pending${b.reasonLogged ? ",理由已留痕但不改变状态" : ""}:${b.codes.join(",")}`
+        : "该片段保持待处理");
+    }
   } catch (e) { toast(e.message); }
 }
 $("lvConfirmAll").addEventListener("click", async () => {
   stopLvPlay();
-  // 先保存当前编辑并重算, 再全部确认
+  // 先保存当前编辑并重算; 阻塞片段即使填理由也不会被确认, 仅确认无阻塞段
   S.lvReport = await saveLevelingPlan();
   renderLeveling(); runChecks();
-  const blocked = S.lvReport.blocked;
-  let reason = "";
-  if (blocked.length) {
-    reason = prompt(`以下片段存在阻塞错误:\n${blocked.join(", ")}\n\n填写人工保留理由后将一并确认(取消则跳过这些片段):`);
-    if (reason === null) { toast("已取消"); return; }
-  }
   const r = await api(`/api/project/${S.projectId}/levelconfirm`, {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ accepted_reason: reason }),
+    body: JSON.stringify({}),
   });
   const st = await api(`/api/project/${S.projectId}/state`);
   S.leveling.items = st.leveling.items || {};
   S.lvReport = r.report;
   renderRevisions(st.revisions);
   renderLeveling(); runChecks(); AudioEngine.invalidateMix();
-  const okN = r.confirmed.length, skipN = r.skipped.length;
-  toast(`确认 ${okN} 段${skipN ? `,跳过 ${skipN} 段` : ""}`);
+  const okN = r.confirmed.length, bN = r.blocked.length;
+  toast(`确认 ${okN} 段${bN ? `;${bN} 段阻塞保持待处理(须修正选区/格式/增益/削波后才能确认)` : ""}`);
 });
 
 // ---- A/B 循环试听(Web Audio)
