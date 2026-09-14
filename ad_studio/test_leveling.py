@@ -245,13 +245,14 @@ class LevelingBlockTests(unittest.TestCase):
         self.assertLessEqual(clip_count, 20,
                              "阻塞片段 +6dB 增益进入了确认版混音 WAV(削波帧 %d)" % clip_count)
 
-        # 复演 JSON: ad3 必须 pending
+        # 复演 JSON: ad3 必须 pending 且不得携带可应用的增益(连 gain 键都不应出现)
         status, _h, out = call("GET", self.base + "/export?what=replay")
         replay = json.loads(out.decode("utf-8"))
         lv = replay["leveling"]["items"]
         self.assertEqual(lv["ad1"]["status"], "confirmed")
         self.assertEqual(lv["ad3"]["status"], "pending")
-        self.assertNotIn(2.0, [lv["ad1"]["gain"]])  # 健康段增益是建议值而非攻击值
+        self.assertNotIn("gain", lv["ad3"], "阻塞片段增益泄漏进复演 JSON")
+        self.assertIn("gain", lv["ad1"])  # 健康确认段增益保留
 
         # 描述脚本: 阻塞段必须标注待处理与阻塞原因
         status, _h, out = call("GET", self.base + "/export?what=script")
@@ -271,6 +272,139 @@ class LevelingBlockTests(unittest.TestCase):
         blocked_ids = [b["desc_id"] for b in r["blocked"]]
         self.assertIn("ad3", blocked_ids)
         self.assertEqual(self.leveling_state()["ad3"]["status"], "pending")
+
+
+class ReplayLeakTests(unittest.TestCase):
+    """四类阻塞在确认版复演 JSON 中都不得携带可应用增益(有/无人工理由两种情况)。"""
+
+    BLOCK = {
+        "ad1": {"code": "gainrange", "item": {"gain": 10.0}},            # +20dB 越界
+        "ad2": {"code": "speech", "item": {"ranges": [{"start": 0.0, "end": 0.10}],
+                                           "gain": 1.5}},                # 有效语音不足
+        "ad3": {"code": "mixclip", "item": {"gain": 2.0}},               # +6dB 削波
+        "ad4": {"code": "channel", "item": {"gain": 1.2}},               # 通道不一致
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="adstudio_replay_")
+        server.DATA = cls.tmp
+        server.DB = os.path.join(cls.tmp, "app.db")
+        server.init_db()
+        cls.pid = server.create_demo()
+        cls.base = "/api/project/%d" % cls.pid
+        st = server.get_state(cls.pid)
+        cls.placements = st["placements"]["placements"]
+        # ad4 绑定片段替换为 2ch/22050Hz(通道不一致), 记录原路径以便还原
+        cls.nid4 = cls.placements["ad4"]["narration_id"]
+        conn = server.db()
+        row = conn.execute("SELECT file_path,data_json FROM assets WHERE id=?",
+                           (cls.nid4,)).fetchone()
+        cls.orig_path, cls.orig_data = row["file_path"], row["data_json"]
+        cls.bad_path = os.path.join(server.proj_dir(cls.pid), "badfmt_replay.wav")
+        with open(cls.bad_path, "wb") as f:
+            f.write(pcm_wav(nch=2, fr=22050))
+        conn.execute("UPDATE assets SET file_path=? WHERE id=?", (cls.bad_path, cls.nid4))
+        conn.commit(); conn.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        conn = server.db()
+        conn.execute("UPDATE assets SET file_path=?, data_json=? WHERE id=?",
+                     (cls.orig_path, cls.orig_data, cls.nid4))
+        conn.commit(); conn.close()
+        if os.path.exists(cls.bad_path):
+            os.remove(cls.bad_path)
+
+    def save(self):
+        body = {"settings": server.default_level_settings(),
+                "items": {did: spec["item"] for did, spec in self.BLOCK.items()}}
+        status, rep = j("POST", self.base + "/leveling", body)
+        self.assertEqual(status, "200 OK")
+        return rep
+
+    def confirm_all(self, reason):
+        return j("POST", self.base + "/levelconfirm",
+                 {"accepted_reason": reason})
+
+    def replay(self):
+        status, _h, out = call("GET", self.base + "/export?what=replay")
+        self.assertEqual(status, "200 OK")
+        return json.loads(out.decode("utf-8"))
+
+    def assert_blocked_codes(self, rep):
+        for did, spec in self.BLOCK.items():
+            self.assertIn(did, rep["blocked"], did)
+            codes = next(e["code"] for e in rep["items"][did]["errors"]
+                         if e["sev"] == "bad" and e["code"] == spec["code"])
+            self.assertEqual(codes, spec["code"])
+
+    def assert_replay_clean(self, replay, reason):
+        """四段 pending、无 gain 键, 但保留选区/状态/(理由)留痕。"""
+        items = replay["leveling"]["items"]
+        for did in self.BLOCK:
+            ent = items[did]
+            self.assertEqual(ent["status"], "pending", did)
+            self.assertNotIn("gain", ent,
+                             "%s 阻塞增益泄漏进复演 JSON: %r" % (did, ent.get("gain")))
+            if reason:
+                self.assertEqual(ent.get("accepted_reason"), reason, did)
+            else:
+                self.assertNotIn("accepted_reason", ent, did)
+
+    def test_codes_detected(self):
+        rep = self.save()
+        self.assert_blocked_codes(rep)
+        self.assertEqual(set(rep["blocked"]), set(self.BLOCK))
+
+    def test_replay_no_gain_without_reason(self):
+        rep = self.save()
+        status, r = self.confirm_all("")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(r["confirmed"], [])
+        self.assertEqual(len(r["blocked"]), 4)
+        self.assertFalse(any(b["reasonLogged"] for b in r["blocked"]))
+        self.assert_replay_clean(self.replay(), "")
+
+    def test_replay_no_gain_with_reason(self):
+        rep = self.save()
+        reason = "保留现场动态"
+        status, r = self.confirm_all(reason)
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(r["confirmed"], [])
+        self.assertTrue(all(b["reasonLogged"] for b in r["blocked"]))
+        # DB 里草稿增益保留(供继续编辑), 但状态 pending
+        st = server.get_state(self.pid)
+        for did, spec in self.BLOCK.items():
+            db_item = st["leveling"]["items"][did]
+            self.assertEqual(db_item["status"], "pending")
+            if "gain" in spec["item"]:
+                self.assertEqual(db_item.get("gain"), spec["item"]["gain"])
+        # 复演导出必须剥除增益, 仅留理由痕迹
+        self.assert_replay_clean(self.replay(), reason)
+        # 理由确实写进修订(留痕), 但摘要表明仍待处理
+        _s, rows = j("GET", self.base + "/revisions")
+        keep = [x for x in rows if x["rationale"] == reason]
+        self.assertEqual(len(keep), 4)
+        self.assertTrue(all("保持待处理" in x["summary"] for x in keep))
+
+    def test_replayed_plan_is_not_applicable_as_gain(self):
+        """把复演 JSON 的 leveling 直接喂给 render_mix, ad3 区间不得出现 +6dB 削波。"""
+        self.save()
+        _s, r = self.confirm_all("")
+        replay = self.replay()
+        st = server.get_state(self.pid)
+        src, nch, fr, clips = server.load_engine_audio(self.pid)
+        plist = [dict(v, desc_id=k) for k, v in st["placements"]["placements"].items()
+                 if v.get("narration_id") and k != "ad4"]  # ad4 通道异常, 不参与渲染
+        dt = {d["id"]: d.get("text", "") for d in st["descriptions"]}
+        mixed, _info, _ = server.render_mix(
+            src, nch, fr, plist, clips, {}, dt, replay["leveling"])
+        f0 = int(self.placements["ad3"]["start"] * fr)
+        clip_count = sum(1 for i in range(int(1.6 * fr))
+                         if abs(mixed[(f0 + i) * nch]) >= 32767)
+        self.assertLessEqual(clip_count, 20,
+                             "复演 JSON 仍可应用阻塞增益(ad3 削波帧 %d)" % clip_count)
 
 
 if __name__ == "__main__":

@@ -602,6 +602,8 @@ def sanitize_leveling_plan(plan, report):
         bad = r is not None and any(e["sev"] == "bad" for e in r["errors"])
         if bad or r is None:
             it["status"] = "pending"
+            if not it.get("accepted_reason"):
+                it.pop("accepted_reason", None)
         # 非 confirmed 不允许残留确认态; confirmed 仅在无阻塞时保留
         if it.get("status") != "confirmed":
             it["status"] = "pending"
@@ -1088,11 +1090,14 @@ def route(environ, start_response):
                 item["ranges"] = r["ranges"]
                 gain = r["gain"] if r["gain"] is not None else r["suggestGain"]
                 if bad:
-                    # 阻塞: 始终 pending; 有理由则把草稿增益与理由留痕, 但不确认
+                    # 阻塞: 始终 pending; 有理由则把草稿增益与理由留痕, 但不确认;
+                    # 无理由则清掉历史残留理由, 避免旧留痕被误当作本次豁免。
                     item["status"] = "pending"
                     if keep_reason:
                         item["accepted_reason"] = keep_reason
                         add_revision(did, r, gain, keep_reason, True)
+                    else:
+                        item.pop("accepted_reason", None)
                     plan["items"][did] = item
                     blocked.append({"desc_id": did, "reason": "存在阻塞错误,片段保持待处理",
                                     "errors": [e["msg"] for e in bad],
@@ -1116,9 +1121,9 @@ def route(environ, start_response):
             if confirmed:
                 safe_plan = sanitize_leveling_plan(plan, report)
                 save_leveling(pid, safe_plan)
-            # 即使没有 confirmed(全部被阻塞), 理由也已写修订; plan 中的 pending 备注回存
-            elif any(b["reasonLogged"] for b in blocked):
-                save_leveling(pid, plan)
+            # 即使没有 confirmed(全部被阻塞), 也回存 pending 状态(可能清掉了残留理由)
+            elif blocked:
+                save_leveling(pid, sanitize_leveling_plan(plan, report))
             st2 = get_state(pid)
             report2 = leveling_report(st2, st2.get("leveling") or plan,
                                        src, nch, fr, narr_clips)
@@ -1179,19 +1184,25 @@ def route(environ, start_response):
                 return err(start_response, "项目不存在", "404 Not Found")
             # 导出前统一实时校审: 阻塞片段不得在脚本/复演里以 confirmed 与增益出现
             stored_lv = st.get("leveling") or {"settings": default_level_settings(), "items": {}}
-            eff_lv = stored_lv
+            lv_report = None
             if st.get("source"):
                 try:
                     src2, nc2, fr2, clips2 = load_engine_audio(pid)
                     lv_report = leveling_report(st, stored_lv, src2, nc2, fr2, clips2)
-                    eff_lv = sanitize_leveling_plan(stored_lv, lv_report)
-                    eff_lv["blocked"] = {did: [e["code"] for e in r["errors"] if e["sev"] == "bad"]
-                                         for did, r in lv_report["items"].items()
-                                         if any(e["sev"] == "bad" for e in r["errors"])}
                 except FileNotFoundError:
-                    eff_lv = sanitize_leveling_plan(stored_lv, {"items": {}})
+                    lv_report = None
+            if lv_report is not None:
+                eff_lv = sanitize_leveling_plan(stored_lv, lv_report)
+                blocked_map = {did: [e["code"] for e in r["errors"] if e["sev"] == "bad"]
+                               for did, r in lv_report["items"].items()
+                               if any(e["sev"] == "bad" for e in r["errors"])}
+                report_ids = set(lv_report["items"].keys())
             else:
+                # 正片/音频缺失无法校审: 全部降级 pending, 阻塞码置空(按不可确认处理)
                 eff_lv = sanitize_leveling_plan(stored_lv, {"items": {}})
+                blocked_map = {}
+                report_ids = set()
+            eff_lv["blocked"] = blocked_map
             if what == "script":
                 text = build_script(dict(st, leveling=eff_lv))
                 body = text.encode("utf-8")
@@ -1201,11 +1212,22 @@ def route(environ, start_response):
                     ("Content-Length", str(len(body)))])
                 return [body]
             if what == "replay":
+                # 复演 JSON 是可再导入的确认版参数: 阻塞片段(status=pending 且有阻塞码,
+                # 或未绑定)只保留状态/选区/人工理由留痕, 剥除 gain, 使复演无法应用
+                # 本应排除的增益草稿。
+                replay_items = {}
+                for did, it in eff_lv["items"].items():
+                    entry = {k: v for k, v in it.items() if k != "blocked"}
+                    unbound = did not in report_ids
+                    if entry.get("status") != "confirmed" and (did in blocked_map or unbound):
+                        entry.pop("gain", None)
+                    replay_items[did] = entry
+                replay_lv = {"settings": eff_lv["settings"], "items": replay_items}
                 replay = {"project": st["project"], "source": st["source"],
                           "narrations": st["narrations"], "dialogue": st["dialogue"],
                           "scenes": st["scenes"], "descriptions": st["descriptions"],
                           "keysounds": st["keysounds"], "placements": st["placements"],
-                          "leveling": eff_lv,
+                          "leveling": replay_lv,
                           "exported_at": time.time()}
                 body = json.dumps(replay, ensure_ascii=False, indent=2).encode("utf-8")
                 start_response("200 OK", [
