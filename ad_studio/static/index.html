@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>无障碍音频描述配轨校审</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>音频描述配轨校审</h1>
+  <div class="proj-bar">
+    <select id="projSelect"></select>
+    <input id="newProjName" placeholder="新项目名">
+    <button id="btnNewProj">新建</button>
+    <button id="btnDemo">载入演示项目</button>
+    <span class="spacer"></span>
+    <button id="btnExportScript" disabled>导出描述脚本</button>
+    <button id="btnExportMix" disabled>导出混音 WAV</button>
+    <button id="btnExportReplay" disabled>导出复演 JSON</button>
+  </div>
+</header>
+
+<main>
+  <!-- 左:素材 -->
+  <section id="assetsPanel">
+    <h2>素材</h2>
+    <div class="upload-block">
+      <label>正片 PCM WAV</label>
+      <input type="file" id="fileSource" accept=".wav,audio/wav">
+      <div id="sourceInfo" class="muted">未载入</div>
+    </div>
+    <div class="upload-block">
+      <label>旁白 PCM WAV(可多选)</label>
+      <input type="file" id="fileNarr" accept=".wav,audio/wav" multiple>
+      <ul id="narrList" class="mini-list"></ul>
+    </div>
+    <div class="upload-block">
+      <label>带时码稿件(JSON)</label>
+      <div class="script-btns">
+        <button data-kind="dialogue">对白稿</button>
+        <button data-kind="scenes">场景切点</button>
+        <button data-kind="descriptions">描述稿</button>
+        <button data-kind="keysounds">关键声</button>
+      </div>
+      <input type="file" id="fileScript" accept=".json,application/json" style="display:none">
+      <div class="muted small">对白:[{start,end,speaker,text}] · 场景:[{time,label}] · 描述:[{start,text}] · 关键声:[{start,end,label,maskable}]<br>时码支持秒 / MM:SS.mmm / HH:MM:SS,mmm</div>
+      <div id="scriptInfo" class="muted"></div>
+    </div>
+    <h2>参数</h2>
+    <div class="settings">
+      <label>目标语速(字/秒) <input type="number" id="setRate" step="0.1" value="5.5"></label>
+      <label>相邻描述最小间隔(s) <input type="number" id="setMinGap" step="0.1" value="0.4"></label>
+      <label>压低后原声增益 <input type="number" id="setDuckTo" step="0.05" value="0.35"></label>
+    </div>
+  </section>
+
+  <!-- 中:时间轴 -->
+  <section id="timelinePanel">
+    <div id="transport">
+      <button id="btnPlay">▶ 播放</button>
+      <button id="btnStop">■ 停止</button>
+      <select id="playMode">
+        <option value="mix">混合预览</option>
+        <option value="source">仅原声</option>
+        <option value="narr">仅旁白</option>
+      </select>
+      <span id="timeLabel" class="mono">00:00:00.000</span>
+      <span class="spacer"></span>
+      <label>缩放 <input type="range" id="zoom" min="20" max="200" value="60"></label>
+      <button id="btnRenderMix">渲染混音</button>
+      <span id="mixStatus" class="muted"></span>
+    </div>
+    <div id="waveScroll"><canvas id="wave"></canvas></div>
+    <div id="legend">
+      <span class="lg dlg">对白</span><span class="lg key">关键声(不可遮盖)</span>
+      <span class="lg amb">可让位环境声</span><span class="lg scene">场景切点</span>
+      <span class="lg card">描述卡(可拖动)</span><span class="lg conflict">冲突</span>
+    </div>
+    <h2>描述卡</h2>
+    <div id="descList"></div>
+  </section>
+
+  <!-- 右:校审与修订 -->
+  <section id="qcPanel">
+    <h2>校审 <button id="btnUndo" title="撤销上一次方案调整">↩ 撤销</button></h2>
+    <div id="issueList" class="issues"><div class="muted">载入素材后自动校审</div></div>
+    <h2>修订留痕</h2>
+    <div class="rev-form">
+      <input id="revSummary" placeholder="素材摘要 + 时码(如:ad2 旁白片段2 @00:00:13.100)">
+      <textarea id="revRationale" rows="2" placeholder="采用理由:为什么移动/缩写/压低/保留冲突"></textarea>
+      <button id="btnSaveRev">记录修订</button>
+    </div>
+    <ul id="revList" class="mini-list"></ul>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
