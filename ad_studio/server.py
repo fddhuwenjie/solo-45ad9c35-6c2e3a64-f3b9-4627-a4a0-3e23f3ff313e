@@ -61,6 +61,9 @@ def init_db():
     CREATE TABLE IF NOT EXISTS splice(
         project_id INTEGER PRIMARY KEY,
         data_json TEXT NOT NULL);      -- {settings, items:{descId:{takes,anchors,segments,status}}}
+    CREATE TABLE IF NOT EXISTS duckenv(
+        project_id INTEGER PRIMARY KEY,
+        data_json TEXT NOT NULL);      -- {settings, items:{descId:{points,protected,status}}}
     """)
     conn.commit()
     conn.close()
@@ -265,15 +268,25 @@ def prepare_narr(clip, nch, fr, p, text_len, settings):
         cs = time_compress(cs, nch, speed)
     return cs, (len(cs) // nch) / fr
 
-def build_duck_env(n_frames, nch, fr, prepared, settings):
-    """按 prepared=[(p, cs, dur, gain)] 生成原声压低包络(每帧增益)。"""
+def build_duck_env(n_frames, nch, fr, prepared, settings, exclude_ids=None):
+    """
+    按 prepared 项生成旧版固定斜坡压低包络(每帧增益)。
+    prepared 元素为 (p, cs, dur[, _gain[, desc_id]]); exclude_ids 中的卡
+    (已确认自定义原声让位包络)跳过, 由 DuckEnvComposer 接管, 不重复压低。
+    """
+    exclude_ids = exclude_ids or set()
     duck_to = float(settings.get("duck_to", 0.35))
     pad = float(settings.get("duck_pad", 0.15))
     ramp = 0.15
     env = [1.0] * n_frames
-    for p, cs, dur, _gain in prepared:
+    for item in prepared:
+        p = item[0]
+        did = item[4] if len(item) > 4 else None
+        if did is not None and str(did) in exclude_ids:
+            continue
         if not p.get("duck"):
             continue
+        cs, dur = item[1], item[2]
         t0 = float(p["start"]) - pad
         t1 = float(p["start"]) + dur + pad
         f0, f1 = max(0, int(t0 * fr)), min(n_frames, int(t1 * fr))
@@ -291,21 +304,24 @@ def build_duck_env(n_frames, nch, fr, prepared, settings):
     return env
 
 def render_mix(src_samples, nch, fr, placements, narr_clips, settings, desc_texts=None,
-               leveling=None):
+               leveling=None, duckenv=None):
     """
     placements: [{narration_id, start, duck, gain, abridged, desc_id}]
     narr_clips: {id: (samples, nch, fr)} 原始片段, 此处转换到工程格式
     desc_texts: {desc_id: text} 用于缩写稿计算目标时长
     leveling: {items:{descId:{status:'confirmed', gain}}} 确认版响度增益
+    duckenv: {items:{descId:{status:'confirmed', points}}} 确认版原声让位包络;
+             无自定义包络的卡(含旧项目)仍走固定斜坡
     duck: 在旁白(压缩后)前后 pad 内把原声压到 settings.duck_to, 0.15s 斜坡
     返回 (mixed:array('h'), clip:{frames,peak,first_t}|None, max_lin:float)
     """
     desc_texts = desc_texts or {}
     lv_items = (leveling or {}).get("items", {})
+    de_items = (duckenv or {}).get("items", {})
     n_frames = len(src_samples) // nch
 
     # 预处理各旁白: 格式转换 + 缩写压缩 + 增益(确认版配平优先)
-    prepared = []  # (placement, samples, dur, gain)
+    prepared = []  # (placement, samples, dur, gain, desc_id)
     for p in placements:
         clip = narr_clips.get(str(p["narration_id"]))
         if not clip:
@@ -315,9 +331,18 @@ def render_mix(src_samples, nch, fr, placements, narr_clips, settings, desc_text
         lv = lv_items.get(p.get("desc_id"))
         gain = float(lv["gain"]) if lv and lv.get("status") == "confirmed" and lv.get("gain") is not None \
             else float(p.get("gain", 1.0))
-        prepared.append((p, cs, dur, gain))
+        prepared.append((p, cs, dur, gain, p.get("desc_id")))
 
-    env = build_duck_env(n_frames, nch, fr, prepared, settings)
+    # 确认的自定义包络接管原声增益(增量 min 合成); 其余卡走旧版固定斜坡
+    custom = {str(did): it for did, it in de_items.items()
+              if it.get("status") == "confirmed" and it.get("points")}
+    composer = DuckEnvComposer(n_frames, fr)
+    legacy = build_duck_env(n_frames, nch, fr, prepared, settings, exclude_ids=set(custom))
+    for i, g in enumerate(legacy):
+        composer.env[i] = g
+    for did, it in custom.items():
+        composer.upsert(did, [{"t": float(q["t"]), "g": float(q["g"])} for q in it["points"]])
+    env = composer.env
 
     out = array("f", [0.0]) * (n_frames * nch)
     for f in range(n_frames):
@@ -327,7 +352,7 @@ def render_mix(src_samples, nch, fr, placements, narr_clips, settings, desc_text
             out[base + c] = src_samples[base + c] * g
 
     # 叠旁白
-    for p, cs, dur, gain in prepared:
+    for p, cs, dur, gain, _did in prepared:
         start_f = int(float(p["start"]) * fr)
         cn = len(cs) // nch
         for j in range(cn):
@@ -412,12 +437,22 @@ def leveling_report(st, plan, src, src_nch, src_fr, narr_clips):
         prepared[did] = {"p": p, "cs": cs, "dur": dur, "gain0": gain0,
                          "raw_ch": raw_ch, "raw_fr": raw_fr, "raw_dur": clip_dur,
                          "ranges": ranges, "speed": speed, "narration_id": nid}
-        plist.append((p, cs, dur, gain0))
+        plist.append((p, cs, dur, gain0, did))
 
-    # 原声 + 压低包络(只与 duck 标记有关), 作为各候选混音的底
+    # 原声 + 压低包络: 确认自定义包络接管的卡跳过固定斜坡(由 DuckEnvComposer 合成)
     base = None
     if src is not None:
-        env = build_duck_env(n_frames, src_nch, src_fr, plist, gsettings)
+        de_items = (st.get("duckenv") or {}).get("items", {})
+        custom = {str(did) for did, it in de_items.items()
+                  if it.get("status") == "confirmed" and it.get("points")}
+        composer = DuckEnvComposer(n_frames, src_fr)
+        legacy = build_duck_env(n_frames, src_nch, src_fr, plist, gsettings, exclude_ids=custom)
+        for i, g in enumerate(legacy):
+            composer.env[i] = g
+        for did in custom:
+            it = de_items[did]
+            composer.upsert(did, [{"t": float(q["t"]), "g": float(q["g"])} for q in it["points"]])
+        env = composer.env
         base = array("f", [0.0]) * (n_frames * src_nch)
         for f in range(n_frames):
             b = f * src_nch; g = env[f]
@@ -993,6 +1028,369 @@ def save_splice(pid, plans):
     conn.commit()
     conn.close()
 
+# ---------------------------------------------------------------- 原声让位包络
+#
+# 每张描述卡可保存一个可编辑包络: 关键点 [{t(成片时间, 秒), g(线性增益 0..1)}],
+# 关键点之间逐帧线性插值, 覆盖区外原声增益恒为 1。确认后:
+#   - 该卡不再套用旧版固定斜坡(build_duck_env 按 exclude_ids 跳过);
+#   - 多卡包络按逐帧 min 叠加(与旧斜坡的叠加口径一致);
+#   - 包络同时驱动服务端 WAV 混音、描述脚本与复演 JSON。
+# 无自定义包络(或未确认)的卡(含全部旧项目)完全沿用现有固定压低方式。
+
+DUCKENV_DEFAULTS = {"minGain": 0.05,        # 关键点增益下限(线性, 约 -26 dB)
+                    "maxGain": 1.0,         # 关键点增益上限(禁止提升原声)
+                    "maxSlopePerSec": 6.0,  # 单段斜率上限(线性增益/秒, 0.15s 旧斜坡约 4.3)
+                    "restoreTol": 0.02,     # 结束后恢复判定: 末尾点增益须 ≥ 1-容差
+                    "protectDuckMin": 0.92} # 保护区内原声增益下限
+
+def duckenv_default_points(p, dur, settings):
+    """
+    以旧版固定斜坡为模板生成初始四点包络(渐入/保持/恢复), 与 build_duck_env 同形状:
+    保持深度取 settings.duck_to, 前后各扩 duck_pad, 斜坡 0.15s。
+    """
+    duck_to = float(settings.get("duck_to", 0.35))
+    pad = float(settings.get("duck_pad", 0.15))
+    ramp = 0.15
+    start = float(p.get("start", 0.0))
+    t0 = max(0.0, start - pad)
+    t3 = start + float(dur) + pad
+    t1 = t0 + ramp
+    t2 = max(t1, t3 - ramp)
+    return [{"t": round(t0, 4), "g": 1.0},
+            {"t": round(t1, 4), "g": round(duck_to, 4)},
+            {"t": round(t2, 4), "g": round(duck_to, 4)},
+            {"t": round(t3, 4), "g": 1.0}]
+
+class DuckEnvComposer:
+    """
+    逐帧包络增量合成器(与 wave 后端同一套帧语义)。
+    env 为全片每帧原声增益; upsert/remove 只重算受影响帧区间:
+    修改某卡时, 旧关键点边界与新关键点边界的并集中, 凡曾由该卡决定(min 中命中)
+    或落入新多边形的帧才重算, 其余帧不动。
+    """
+    def __init__(self, n_frames, fr):
+        self.n = n_frames
+        self.fr = fr
+        self.env = [1.0] * n_frames
+        self._owners = {}   # did -> 归一化关键点 [(t,g)]
+        self._bounds = {}   # did -> (f0,f1) 旧影响帧边界
+
+    def _seg_gain(self, pts, f):
+        t = f / self.fr
+        if t <= pts[0][0]:
+            return pts[0][1]
+        if t >= pts[-1][0]:
+            return pts[-1][1]
+        for k in range(len(pts) - 1):
+            t0, g0 = pts[k]; t1, g1 = pts[k + 1]
+            if t0 <= t <= t1:
+                if t1 == t0:
+                    return min(g0, g1)
+                return g0 + (g1 - g0) * (t - t0) / (t1 - t0)
+        return 1.0
+
+    def _bounds_of(self, pts):
+        f0 = max(0, int(pts[0][0] * self.fr))
+        f1 = min(self.n, max(f0 + 1, int(pts[-1][0] * self.fr) + 1))
+        return f0, f1
+
+    def _rebuild_range(self, f0, f1, skip=None):
+        """在 [f0,f1) 内按其余已登记关键点重算(跳过 skip 卡)。"""
+        owners = self._owners
+        for f in range(f0, f1):
+            g = 1.0
+            for did, pts in owners.items():
+                if did == skip:
+                    continue
+                if f < pts[0][0] * self.fr - 1 or f > pts[-1][0] * self.fr + 1:
+                    continue
+                v = self._seg_gain(pts, f)
+                if v < g:
+                    g = v
+            self.env[f] = g
+
+    def upsert(self, did, raw_pts):
+        """写入/替换某卡包络, 只重算新旧影响区间的并集。返回 (f0,f1)。"""
+        pts = sorted((float(q["t"]), max(0.0, min(1.0, float(q["g"])))) for q in raw_pts)
+        nf0, nf1 = self._bounds_of(pts)
+        old = self._bounds.get(did)
+        r0, r1 = (nf0, nf1) if old is None else (min(old[0], nf0), max(old[1], nf1))
+        self._rebuild_range(r0, r1, skip=did)
+        self._owners[did] = pts
+        self._bounds[did] = (nf0, nf1)
+        for f in range(nf0, nf1):
+            v = self._seg_gain(pts, f)
+            if v < self.env[f]:
+                self.env[f] = v
+        return nf0, nf1
+
+    def remove(self, did):
+        """拆除某卡包络, 只重算其旧影响区间。"""
+        old = self._bounds.pop(did, None)
+        self._owners.pop(did, None)
+        if old is None:
+            return None
+        self._rebuild_range(old[0], old[1], skip=did)
+        return old
+
+def _protected_intervals(st):
+    """保护区 = 全部对白 + 不可遮盖(maskable=false)关键声, 返回成片时间区间表。"""
+    zones = [{"kind": "对白", "start": float(g["start"]), "end": float(g["end"]),
+              "label": (g.get("text") or g.get("speaker") or "对白")[:18]}
+             for g in st.get("dialogue") or []]
+    zones += [{"kind": "关键声", "start": float(k["start"]), "end": float(k["end"]),
+               "label": (k.get("label") or "关键声")[:18]}
+              for k in st.get("keysounds") or [] if k.get("maskable") is False]
+    zones.sort(key=lambda z: z["start"])
+    return zones
+
+def duckenv_report(st, plans, src_dur, prepared_durs, gsettings=None):
+    """
+    让位包络校审(纯计算, 不写库), 逐卡检查:
+      pointcount  关键点不足(渐入/保持/恢复至少 4 点)
+      order       关键点倒序/重合
+      gainrange   增益越界(允许 0..1, 不允许提升原声)
+      slope       斜率过陡(瞬时塌陷/恢复, 定位段首时码与 dB/s)
+      restore     结束后未恢复到 1
+      protect     保护区误压(对白/不可遮盖关键声被压低, 定位保护区与最深帧时码)
+      overlap     相邻包络叠加过深(交叠区合成增益低于两者最深保持值, 定位时码)
+    bad 阻塞确认; 同 splice/leveling 口径, 返回 {settings, items, order, blocked}。
+    prepared_durs: {did: 压缩后旁白时长}(与帧渲染同口径), 缺省时用绑定素材原长。
+    """
+    gsettings = gsettings or st.get("placements", {}).get("settings", {}) or {}
+    settings = dict(DUCKENV_DEFAULTS)
+    settings.update((plans or {}).get("settings") or {})
+    gmin, gmax = float(settings["minGain"]), float(settings["maxGain"])
+    max_slope = float(settings["maxSlopePerSec"])
+    tol = float(settings["restoreTol"])
+    protect_floor = float(settings["protectDuckMin"])
+    placements = st.get("placements", {}).get("placements", {})
+    desc_by_id = {d["id"]: d for d in st.get("descriptions") or []}
+    zones = _protected_intervals(st)
+
+    # 归一化关键点 + 结构性检查(不依赖音频)
+    raw_items = {}
+    for did, plan in ((plans or {}).get("items") or {}).items():
+        errors = []
+        raw = plan.get("points") or []
+        pts = []
+        for q in raw:
+            try:
+                pts.append({"t": float(q["t"]), "g": float(q["g"])})
+            except (TypeError, ValueError, KeyError):
+                continue
+        p = placements.get(did) or {}
+        start = float(p.get("start", (desc_by_id.get(did) or {}).get("start", 0) or 0))
+        dur = float((prepared_durs or {}).get(did) or 0.0)
+        pts_sorted = sorted(pts, key=lambda q: q["t"])
+
+        if len(pts_sorted) < 4:
+            errors.append({"code": "pointcount", "sev": "bad", "msg":
+                "关键点不足:仅 %d 个点,让位包络至少需要 渐入/保持/恢复 4 个关键点" % len(pts_sorted)})
+        # 倒序(原序与时序不一致或存在重合时间)
+        if any(pts[i]["t"] > pts[i + 1]["t"] + 1e-9 for i in range(len(pts) - 1)):
+            bad_i = next(i for i in range(len(pts) - 1) if pts[i]["t"] > pts[i + 1]["t"])
+            errors.append({"code": "order", "sev": "bad", "msg":
+                "关键点倒序:第%d点 %s 晚于第%d点 %s,请按时间重排" % (
+                    bad_i + 1, fmt_tc(pts[bad_i]["t"]), bad_i + 2, fmt_tc(pts[bad_i + 1]["t"]))})
+        if any(abs(pts_sorted[i]["t"] - pts_sorted[i + 1]["t"]) < 1e-6
+               for i in range(len(pts_sorted) - 1)):
+            dup = next(pts_sorted[i]["t"] for i in range(len(pts_sorted) - 1)
+                       if abs(pts_sorted[i]["t"] - pts_sorted[i + 1]["t"]) < 1e-6)
+            errors.append({"code": "order", "sev": "bad", "msg":
+                "关键点重合:存在两个关键点落在同一时码 %s" % fmt_tc(dup)})
+        # 增益越界(0..1: 不允许负增益/提升原声)
+        for i, q in enumerate(pts_sorted):
+            if q["g"] < gmin - 1e-9 or q["g"] > gmax + 1e-9:
+                errors.append({"code": "gainrange", "sev": "bad", "msg":
+                    "增益越界:关键点 %s 增益 %.2f,允许范围 %.2f~%.2f(原声让位只可衰减不可提升)" % (
+                        fmt_tc(q["t"]), q["g"], gmin, gmax)})
+                break
+        # 斜率过陡 + 收集保持深度
+        hold_floor = 1.0
+        for i in range(len(pts_sorted) - 1):
+            t0, g0 = pts_sorted[i]["t"], pts_sorted[i]["g"]
+            t1, g1 = pts_sorted[i + 1]["t"], pts_sorted[i + 1]["g"]
+            dt = t1 - t0
+            if dt <= 1e-6:
+                continue
+            slope = abs(g1 - g0) / dt
+            if g0 < hold_floor: hold_floor = g0
+            if g1 < hold_floor: hold_floor = g1
+            if slope > max_slope:
+                db_s = abs(dbfs(max(g1, 1e-6)) - dbfs(max(g0, 1e-6))) / dt
+                errors.append({"code": "slope", "sev": "bad", "msg":
+                    "斜率过陡:%s–%s 段增益变化 %.2f(%.1f dB/s,上限 %.1f/s),"
+                    "原声会瞬时塌陷或恢复,请拉长渐入/恢复" % (
+                        fmt_tc(t0), fmt_tc(t1), abs(g1 - g0), db_s, max_slope)})
+        # 结束后未恢复: 最后一个关键点必须回到 1(容差 tol)
+        if pts_sorted and pts_sorted[-1]["g"] < 1.0 - tol:
+            errors.append({"code": "restore", "sev": "bad", "msg":
+                "结束后未恢复:末关键点 %s 增益 %.2f(< %.2f),旁白过后原声仍被压低,请把恢复点拉回 1.0" % (
+                    fmt_tc(pts_sorted[-1]["t"]), pts_sorted[-1]["g"], 1.0 - tol)})
+        # 越出片长
+        if src_dur and pts_sorted and (pts_sorted[0]["t"] < -1e-6 or pts_sorted[-1]["t"] > src_dur + 1e-6):
+            errors.append({"code": "order", "sev": "bad", "msg":
+                "关键点越出正片:包络区间 %s–%s 超出片长 %s" % (
+                    fmt_tc(pts_sorted[0]["t"]), fmt_tc(pts_sorted[-1]["t"]), fmt_tc(src_dur))})
+        raw_items[did] = {"plan": plan, "pts": pts_sorted, "errors": errors,
+                          "start": start, "dur": dur, "hold_floor": hold_floor}
+
+    # 保护区误压(多边形采样, 定位最深帧)与相邻叠加过深(成对区间)
+    SAMPLE_DT = 0.002
+    for did, info in raw_items.items():
+        pts = info["pts"]
+        if not pts:
+            continue
+        t_a, t_b = pts[0]["t"], pts[-1]["t"]
+        # 自动保护区(对白+不可遮盖关键声) + 该卡人工锁定保护区
+        manual = []
+        mp = info["plan"].get("protected")
+        if isinstance(mp, list):
+            for z in mp:
+                if isinstance(z, dict) and "start" in z and "end" in z:
+                    try:
+                        manual.append({"kind": "人工保护区", "start": float(z["start"]),
+                                       "end": float(z["end"]),
+                                       "label": str(z.get("label") or "自定义")[:18]})
+                    except (TypeError, ValueError):
+                        continue
+        card_zones = zones + manual
+        def gain_at(t):
+            if t <= pts[0]["t"]: return pts[0]["g"]
+            if t >= pts[-1]["t"]: return pts[-1]["g"]
+            for k in range(len(pts) - 1):
+                t0, g0 = pts[k]["t"], pts[k]["g"]; t1, g1 = pts[k + 1]["t"], pts[k + 1]["g"]
+                if t0 <= t <= t1:
+                    return g0 + (g1 - g0) * (t - t0) / (t1 - t0) if t1 > t0 else min(g0, g1)
+            return 1.0
+        for z in card_zones:
+            lo, hi = max(t_a, z["start"]), min(t_b, z["end"])
+            if hi - lo <= 1e-6:
+                continue
+            worst_t, worst_g = None, protect_floor
+            n = max(1, int((hi - lo) / SAMPLE_DT))
+            for k in range(n + 1):
+                t = min(hi, lo + (hi - lo) * k / n)
+                g = gain_at(t)
+                if g < worst_g - 1e-9:
+                    worst_g, worst_t = g, t
+            if worst_t is not None:
+                info["errors"].append({"code": "protect", "sev": "bad", "msg":
+                    "保护区误压:%s「%s」%s–%s 内原声被压到 %.2f(最深 %s),"
+                    "对白/不可遮盖关键声须锁为保护区,请上抬或移开包络" % (
+                        z["kind"], z["label"], fmt_tc(z["start"]), fmt_tc(z["end"]),
+                        worst_g, fmt_tc(worst_t))})
+        # 相邻包络叠加: 交叠区逐帧 min 低于两者最深保持值(刻意双层让位除外需显式重做)
+        for did2, info2 in raw_items.items():
+            if did2 <= did:
+                continue
+            q2 = info2["pts"]
+            if not q2:
+                continue
+            lo, hi = max(t_a, q2[0]["t"]), min(t_b, q2[-1]["t"])
+            if hi - lo <= 1e-6:
+                continue
+            floor = max(info["hold_floor"], info2["hold_floor"])  # 叠加后不应比单层更深
+            def gain2_at(t):
+                if t <= q2[0]["t"]: return q2[0]["g"]
+                if t >= q2[-1]["t"]: return q2[-1]["g"]
+                for k in range(len(q2) - 1):
+                    t0, g0 = q2[k]["t"], q2[k]["g"]; t1, g1 = q2[k + 1]["t"], q2[k + 1]["g"]
+                    if t0 <= t <= t1:
+                        return g0 + (g1 - g0) * (t - t0) / (t1 - t0) if t1 > t0 else min(g0, g1)
+                return 1.0
+            worst_t, worst_g = None, floor
+            n = max(1, int((hi - lo) / SAMPLE_DT))
+            for k in range(n + 1):
+                t = min(hi, lo + (hi - lo) * k / n)
+                g = min(gain_at(t), gain2_at(t))
+                if g < worst_g - 1e-9:
+                    worst_g, worst_t = g, t
+            if worst_t is not None:
+                info["errors"].append({"code": "overlap", "sev": "bad", "msg":
+                    "相邻包络叠加过深:%s 与 %s 在 %s–%s 交叠,合成增益最低 %.2f(最深 %s),"
+                    "低于单层保持 %.2f,两段让位会互相踩踏,请错开恢复/渐入" % (
+                        did, did2, fmt_tc(lo), fmt_tc(hi), worst_g, fmt_tc(worst_t), floor)})
+
+    items = {}
+    for did, info in raw_items.items():
+        plan = info["plan"]
+        pts = info["pts"]
+        manual_norm = []
+        mp = plan.get("protected")
+        if isinstance(mp, list):
+            for z in mp:
+                if isinstance(z, dict) and "start" in z and "end" in z:
+                    try:
+                        manual_norm.append({"start": round(float(z["start"]), 4),
+                                            "end": round(float(z["end"]), 4),
+                                            "label": str(z.get("label") or "自定义")[:18]})
+                    except (TypeError, ValueError):
+                        continue
+        items[did] = {
+            "desc_id": did, "start": info["start"], "duration": round(info["dur"], 3),
+            "points": [{"t": round(q["t"], 4), "g": round(max(gmin, min(gmax, q["g"])), 4)}
+                       for q in pts],
+            "protected": manual_norm,
+            "autoProtected": [{"kind": z["kind"], "start": z["start"], "end": z["end"],
+                               "label": z["label"]} for z in zones],
+            "span": [round(pts[0]["t"], 4), round(pts[-1]["t"], 4)] if pts else [0, 0],
+            "holdDb": round(dbfs(max(info["hold_floor"], 1e-6)), 2),
+            "status": plan.get("status", "pending"),
+            "acceptedReason": plan.get("accepted_reason", ""),
+            "errors": info["errors"]}
+    order = sorted(items.keys(), key=lambda d: items[d]["start"])
+    blocked = [d for d in order if any(e["sev"] == "bad" for e in items[d]["errors"])]
+    return {"settings": settings, "items": items, "order": order, "blocked": blocked}
+
+def sanitize_duckenv(plans, report):
+    """
+    按实时校审纠正包络方案状态(纵深防御, 同 leveling/splice):
+    存在 bad 阻塞(倒序/越界/过陡/未恢复/误压保护区/叠加过深等)或无报告的方案
+    强制 pending; 仅无阻塞且 status=confirmed 的方案保留 confirmed, 其关键点才进
+    确认版混音/脚本/复演。注意: 不得替编辑者排序/夹幅 —— 倒序与增益越界必须持续
+    阻塞到人工修正(帧级合成本身对增益做 0..1 防御性夹幅, 与确认状态无关)。
+    """
+    safe = {"settings": (plans or {}).get("settings") or dict(DUCKENV_DEFAULTS), "items": {}}
+    rep_items = (report or {}).get("items") or {}
+    for did, plan in ((plans or {}).get("items") or {}).items():
+        it = dict(plan)
+        r = rep_items.get(did)
+        bad = r is not None and any(e["sev"] == "bad" for e in r["errors"])
+        if bad or r is None or not it.get("points"):
+            it["status"] = "pending"
+            if not it.get("accepted_reason"):
+                it.pop("accepted_reason", None)
+        if it.get("status") != "confirmed":
+            it["status"] = "pending"
+        # 保留原始顺序与数值(仅四舍五入); span/holdDb 等派生信息取自报告
+        it["points"] = [{"t": round(float(q.get("t", 0)), 4),
+                         "g": round(float(q.get("g", 1)), 4)}
+                        for q in it.get("points") or []]
+        if r is not None:
+            it["span"] = list(r.get("span") or [0, 0])
+            it["holdDb"] = r.get("holdDb", EPS_DB)
+        if not isinstance(it.get("protected"), list):
+            it["protected"] = []
+        safe["items"][did] = it
+    return safe
+
+def duckenv_content(plan):
+    """参与确认状态的内容(变更即需重新确认): 关键点与人工保护区。"""
+    return {"points": [{"t": round(float(q.get("t", 0)), 4),
+                        "g": round(float(q.get("g", 1)), 4)}
+                       for q in (plan.get("points") or [])],
+            "protected": sorted(str(z) for z in (plan.get("protected") or []))}
+
+def save_duckenv(pid, plans):
+    conn = db()
+    conn.execute("INSERT INTO duckenv(project_id,data_json) VALUES(?,?) "
+                 "ON CONFLICT(project_id) DO UPDATE SET data_json=excluded.data_json",
+                 (pid, json.dumps(plans, ensure_ascii=False)))
+    conn.commit()
+    conn.close()
+
 # ---------------------------------------------------------------- 时码解析
 
 def parse_tc(v):
@@ -1045,6 +1443,7 @@ def get_state(pid):
     pl = conn.execute("SELECT data_json FROM placements WHERE project_id=?", (pid,)).fetchone()
     lv = conn.execute("SELECT data_json FROM leveling WHERE project_id=?", (pid,)).fetchone()
     sp = conn.execute("SELECT data_json FROM splice WHERE project_id=?", (pid,)).fetchone()
+    de = conn.execute("SELECT data_json FROM duckenv WHERE project_id=?", (pid,)).fetchone()
     revs = conn.execute(
         "SELECT id,created,summary,rationale FROM revisions WHERE project_id=? ORDER BY id DESC",
         (pid,)).fetchall()
@@ -1056,6 +1455,7 @@ def get_state(pid):
              "placements": {"placements": {}, "settings": {}},
              "leveling": {"settings": default_level_settings(), "items": {}},
              "splice": {"settings": dict(SPLICE_DEFAULTS), "items": {}},
+             "duckenv": {"settings": dict(DUCKENV_DEFAULTS), "items": {}},
              "spliceResolved": {},
              "revisions": [dict(r) for r in revs]}
     for a in assets:
@@ -1075,6 +1475,8 @@ def get_state(pid):
         state["leveling"] = json.loads(lv["data_json"])
     if sp:
         state["splice"] = json.loads(sp["data_json"])
+    if de:
+        state["duckenv"] = json.loads(de["data_json"])
     # 确认且健康的拼接方案: 实时校审 + 合成, 供前端显示合成时长/电平曲线
     sp_items = state["splice"].get("items") or {}
     if state["source"] and any(p.get("status") == "confirmed" for p in sp_items.values()):
@@ -1339,6 +1741,23 @@ def load_engine_audio(pid):
         src, nch, fr = read_wav(f.read())
     return src, nch, fr, narr_clips
 
+def resolved_duckenv(st, nch, fr, narr_clips, src_dur):
+    """
+    对当前方案做实时校审并按纵深防御归一化(供混音/导出统一调用)。
+    返回 (safe_plans, report); 拼接注入后的状态 st 与混音口径一致。
+    """
+    plans = st.get("duckenv") or {"settings": dict(DUCKENV_DEFAULTS), "items": {}}
+    gsettings = st["placements"].get("settings", {})
+    desc_texts = {d["id"]: d.get("text", "") for d in st.get("descriptions") or []}
+    durs = {}
+    for did, p in (st["placements"].get("placements", {}) or {}).items():
+        clip = narr_clips.get(str(p.get("narration_id")))
+        if clip:
+            _cs, dur = prepare_narr(clip, nch, fr, p, len(desc_texts.get(did, "")), gsettings)
+            durs[did] = dur
+    report = duckenv_report(st, plans, src_dur, durs, gsettings)
+    return sanitize_duckenv(plans, report), report
+
 def app(environ, start_response):
     try:
         return route(environ, start_response)
@@ -1464,9 +1883,12 @@ def route(environ, start_response):
             stored_lv = st.get("leveling") or {"settings": default_level_settings(), "items": {}}
             lv_report = leveling_report(st, stored_lv, src, nch, fr, narr_clips)
             eff_lv = sanitize_leveling_plan(stored_lv, lv_report)
+            # 确认版原声让位包络出口前再校验: 阻塞卡强制 pending, 不进混音 WAV
+            eff_de, de_report = resolved_duckenv(
+                st, nch, fr, narr_clips, (len(src) // nch) / fr)
             mixed, clipinfo, _peak = render_mix(
                 src, nch, fr, plist, narr_clips, pdata.get("settings", {}),
-                desc_texts, eff_lv)
+                desc_texts, eff_lv, eff_de)
             wav_bytes = write_wav(mixed, nch, fr)
             with open(os.path.join(proj_dir(pid), "mix.wav"), "wb") as f:
                 f.write(wav_bytes)
@@ -1475,6 +1897,8 @@ def route(environ, start_response):
                                               "confirmedLeveled": [did for did, it in eff_lv["items"].items()
                                                                    if it.get("status") == "confirmed"],
                                               "confirmedSpliced": sorted(injected.keys()),
+                                              "confirmedDuckenv": [did for did, it in eff_de["items"].items()
+                                                                   if it.get("status") == "confirmed"],
                                               "url": "/api/project/%d/file?which=mix" % pid})
 
         if sub == "leveling" and method == "POST":
@@ -1608,7 +2032,8 @@ def route(environ, start_response):
                      "items": body.get("items") or {}}
             old_items = (st.get("splice") or {}).get("items", {})
             lv = st.get("leveling") or {"settings": default_level_settings(), "items": {}}
-            lv_changed = False
+            de = st.get("duckenv") or {"settings": dict(DUCKENV_DEFAULTS), "items": {}}
+            lv_changed = de_changed = False
             for did, plan in plans["items"].items():
                 old = old_items.get(did)
                 if old and old.get("status") == "confirmed" and \
@@ -1617,8 +2042,15 @@ def route(environ, start_response):
                     if did in (lv.get("items") or {}):
                         del lv["items"][did]
                         lv_changed = True
+                    # 合成片段时长口径变化: 该卡已确认让位包络区间可能失配, 强制重确认
+                    de_it = (de.get("items") or {}).get(did)
+                    if de_it and de_it.get("status") == "confirmed":
+                        de_it["status"] = "pending"
+                        de_changed = True
             if lv_changed:
                 save_leveling(pid, lv)
+            if de_changed:
+                save_duckenv(pid, de)
             clips = load_narr_clips(pid)
             smeta = st["source"]
             report = splice_report(st, plans, smeta["channels"], smeta["framerate"],
@@ -1712,11 +2144,132 @@ def route(environ, start_response):
             if did in (lv.get("items") or {}):
                 del lv["items"][did]
                 save_leveling(pid, lv)
+            # 合成片段替代整段绑定: 旧让位包络区间按新时长重确认
+            de = st.get("duckenv") or {"settings": dict(DUCKENV_DEFAULTS), "items": {}}
+            de_it = (de.get("items") or {}).get(did)
+            if de_it and de_it.get("status") == "confirmed":
+                de_it["status"] = "pending"
+                save_duckenv(pid, de)
             save_splice(pid, sanitize_splice(plans, report))
             st2 = get_state(pid)
             return json_resp(start_response, {"ok": True, "confirmed": [did], "blocked": [],
                                               "report": report,
                                               "resolved": st2["spliceResolved"],
+                                              "revisions": st2["revisions"]})
+
+        if sub == "duckenv" and method == "POST":
+            # 保存包络方案(关键点/人工保护区)并返回校审报告。阻塞一律强制 pending;
+            # 已确认方案的关键点/保护区被改时后端同样强制回到待处理。
+            body = json.loads(read_body(environ) or b"{}")
+            st = get_state(pid)
+            if not st or not st["source"]:
+                return err(start_response, "请先载入正片 WAV")
+            # 与 /splice 同口径: 客户端提交全量 items 覆盖; 合并缺失卡可避免
+            # 旧客户端只传单卡时丢掉其他卡的草稿/确认(前端始终发送全量)。
+            old_items = (st.get("duckenv") or {}).get("items") or {}
+            merged_items = dict(old_items)
+            merged_items.update(body.get("items") or {})
+            plans = {"settings": body.get("settings") or dict(DUCKENV_DEFAULTS),
+                     "items": merged_items}
+            src, nch, fr, narr_clips = load_engine_audio(pid)
+            # 确认的拼接方案以合成片段参与区间计算
+            sp_rep = splice_report(st, st.get("splice") or {}, nch, fr,
+                                   (len(src) // nch) / fr, narr_clips)
+            ov, injected = apply_splice_inject(st, narr_clips, nch, fr, sp_rep)
+            st = spliced_state(st, ov, injected)
+            src_dur = (len(src) // nch) / fr
+            gsettings = st["placements"].get("settings", {})
+            desc_texts = {d["id"]: d.get("text", "") for d in st["descriptions"]}
+            durs = {}
+            for did, p in st["placements"].get("placements", {}).items():
+                clip = narr_clips.get(str(p.get("narration_id")))
+                if clip:
+                    _cs, d = prepare_narr(clip, nch, fr, p, len(desc_texts.get(did, "")), gsettings)
+                    durs[did] = d
+            report = duckenv_report(st, plans, src_dur, durs, gsettings)
+            safe = sanitize_duckenv(plans, report)
+            save_duckenv(pid, safe)
+            return json_resp(start_response, {"report": report, "plans": safe})
+
+        if sub == "duckenvconfirm" and method == "POST":
+            # 确认单个包络。硬规则: 关键点倒序/重合、增益越界、斜率过陡、结束后未恢复、
+            # 保护区误压、相邻叠加过深任一存在时, 无论是否填写人工理由都保持 pending,
+            # 关键点不进确认版混音/脚本/复演; 理由只写入修订留痕。
+            body = json.loads(read_body(environ) or b"{}")
+            did = body.get("desc_id")
+            reason = (body.get("accepted_reason") or "").strip()
+            st = get_state(pid)
+            if not st or not st["source"]:
+                return err(start_response, "请先载入正片 WAV")
+            if not did:
+                return err(start_response, "请指定要确认的描述卡")
+            src, nch, fr, narr_clips = load_engine_audio(pid)
+            sp_rep = splice_report(st, st.get("splice") or {}, nch, fr,
+                                   (len(src) // nch) / fr, narr_clips)
+            ov, injected = apply_splice_inject(st, narr_clips, nch, fr, sp_rep)
+            st = spliced_state(st, ov, injected)
+            src_dur = (len(src) // nch) / fr
+            plans = st.get("duckenv") or {"settings": dict(DUCKENV_DEFAULTS), "items": {}}
+            if did not in (plans.get("items") or {}):
+                return err(start_response, "该描述卡没有让位包络")
+            safe, report = resolved_duckenv(st, nch, fr, narr_clips, src_dur)
+            r = report["items"].get(did)
+            bad = [e for e in r["errors"] if e["sev"] == "bad"] if r else []
+
+            def add_de_revision(blocked_flag):
+                pts_txt = "; ".join("%s@%.2f" % (fmt_tc(q["t"]), q["g"])
+                                    for q in (r["points"] if r else []))
+                snap = {"kind": "duckenv_pending" if blocked_flag else "duckenv",
+                        "desc_id": did, "points": r["points"] if r else [],
+                        "protected": (safe["items"].get(did) or {}).get("protected", []),
+                        "span": r["span"] if r else [0, 0], "holdDb": r["holdDb"] if r else EPS_DB,
+                        "blocked": blocked_flag,
+                        "blockedErrors": [e["code"] for e in bad] if blocked_flag else [],
+                        "accepted_reason": reason, "settings": plans.get("settings", {})}
+                if blocked_flag:
+                    summary = "原声让位保持待处理 %s [%s–%s]" % (
+                        did, fmt_tc((r["span"] or [0])[0]), fmt_tc((r["span"] or [0])[1]))
+                    rationale = reason
+                else:
+                    summary = "原声让位确认 %s [%s–%s] 保持 %.1f dB" % (
+                        did, fmt_tc(r["span"][0]), fmt_tc(r["span"][1]), r["holdDb"])
+                    rationale = reason or "渐入/保持/恢复关键点: %s" % pts_txt
+                conn2 = db()
+                conn2.execute("INSERT INTO revisions(project_id,created,summary,rationale,snapshot_json) "
+                              "VALUES(?,?,?,?,?)",
+                              (pid, time.time(), summary, rationale,
+                               json.dumps(snap, ensure_ascii=False)))
+                conn2.commit(); conn2.close()
+
+            if bad or r is None:
+                safe["items"][did]["status"] = "pending"
+                if reason:
+                    safe["items"][did]["accepted_reason"] = reason
+                    add_de_revision(True)
+                else:
+                    safe["items"][did].pop("accepted_reason", None)
+                save_duckenv(pid, safe)
+                st2 = get_state(pid)
+                return json_resp(start_response, {
+                    "ok": False, "confirmed": [],
+                    "blocked": [{"desc_id": did,
+                                 "errors": [e["msg"] for e in bad],
+                                 "codes": [e["code"] for e in bad],
+                                 "reasonLogged": bool(reason)}],
+                    "report": report, "plans": safe,
+                    "revisions": st2["revisions"]})
+            # 无阻塞: 确认
+            item = safe["items"][did]
+            item["status"] = "confirmed"
+            if reason:
+                item["accepted_reason"] = reason
+            else:
+                item.pop("accepted_reason", None)
+            save_duckenv(pid, safe)
+            add_de_revision(False)
+            st2 = get_state(pid)
+            return json_resp(start_response, {"ok": True, "confirmed": [did], "blocked": [],
+                                              "report": report, "plans": safe,
                                               "revisions": st2["revisions"]})
 
         if sub == "file" and method == "GET":
@@ -1770,8 +2323,11 @@ def route(environ, start_response):
             # 拼接方案同样: 阻塞/待处理不注入, 确认版合成片段进入配平/脚本/复演。
             stored_lv = st.get("leveling") or {"settings": default_level_settings(), "items": {}}
             sp_stored = st.get("splice") or {"settings": dict(SPLICE_DEFAULTS), "items": {}}
+            de_stored = st.get("duckenv") or {"settings": dict(DUCKENV_DEFAULTS), "items": {}}
             sp_eff = sp_stored
             sp_blocked = {}
+            de_eff = de_stored
+            de_blocked = {}
             lv_report = None
             if st.get("source"):
                 try:
@@ -1784,15 +2340,25 @@ def route(environ, start_response):
                     sp_blocked = {did: [e["code"] for e in r["errors"] if e["sev"] == "bad"]
                                   for did, r in sp_rep["items"].items()
                                   if any(e["sev"] == "bad" for e in r["errors"])}
+                    # 让位包络同样: 阻塞/待处理不进确认版, 只有确认包络进入脚本/复演
+                    de_eff, de_rep = resolved_duckenv(st, nc2, fr2, clips2,
+                                                      st["source"]["duration"])
+                    de_blocked = {did: [e["code"] for e in r["errors"] if e["sev"] == "bad"]
+                                  for did, r in de_rep["items"].items()
+                                  if any(e["sev"] == "bad" for e in r["errors"])}
                     lv_report = leveling_report(st, stored_lv, src2, nc2, fr2, clips2)
                 except FileNotFoundError:
                     lv_report = None
                     sp_eff = sanitize_splice(sp_stored, {"items": {}})
+                    de_eff = sanitize_duckenv(de_stored, {"items": {}})
                     st["splice"] = sp_eff
             else:
                 sp_eff = sanitize_splice(sp_stored, {"items": {}})
+                de_eff = sanitize_duckenv(de_stored, {"items": {}})
             st["splice"] = sp_eff
             st["spliceBlocked"] = sp_blocked
+            st["duckenv"] = de_eff
+            st["duckenvBlocked"] = de_blocked
             if lv_report is not None:
                 eff_lv = sanitize_leveling_plan(stored_lv, lv_report)
                 blocked_map = {did: [e["code"] for e in r["errors"] if e["sev"] == "bad"]
@@ -1825,12 +2391,23 @@ def route(environ, start_response):
                         entry.pop("gain", None)
                     replay_items[did] = entry
                 replay_lv = {"settings": eff_lv["settings"], "items": replay_items}
+                # 让位包络: 阻塞/待处理卡剥除关键点(复演文件无法应用本应排除的包络),
+                # 只保留状态/人工保护区/理由留痕; 健康确认卡完整携带 points 驱动复演混音。
+                replay_de_items = {}
+                for did2, it in (de_eff.get("items") or {}).items():
+                    entry = {k: v for k, v in it.items()}
+                    if entry.get("status") != "confirmed" and (did2 in de_blocked):
+                        entry.pop("points", None)
+                    replay_de_items[did2] = entry
+                replay_de = {"settings": de_eff.get("settings", dict(DUCKENV_DEFAULTS)),
+                             "items": replay_de_items}
                 replay = {"project": st["project"], "source": st["source"],
                           "narrations": st["narrations"], "dialogue": st["dialogue"],
                           "scenes": st["scenes"], "descriptions": st["descriptions"],
                           "keysounds": st["keysounds"], "placements": st["placements"],
                           "leveling": replay_lv,
                           "splice": sp_eff,
+                          "duckenv": replay_de,
                           "exported_at": time.time()}
                 body = json.dumps(replay, ensure_ascii=False, indent=2).encode("utf-8")
                 start_response("200 OK", [
@@ -1870,6 +2447,8 @@ def build_script(st):
     lv_items = leveling.get("items", {})
     lv_settings = default_level_settings()
     lv_settings.update(leveling.get("settings") or {})
+    de_items = (st.get("duckenv") or {}).get("items", {})
+    de_blocked = st.get("duckenvBlocked") or {}
     L.append("")
     L.append("# 响度配平目标: %.1f dBFS · 峰值上限 %.1f dBFS · 相邻跳变阈值 %.1f dB" % (
         lv_settings["targetDb"], lv_settings["ceilingDb"], lv_settings["maxJumpDb"]))
@@ -1926,6 +2505,24 @@ def build_script(st):
                 if lv.get("accepted_reason"):
                     note += " 人工留痕(不改状态): " + lv["accepted_reason"]
                 L.append("    响度配平: " + note)
+        # 原声让位包络: 确认版列出关键点/保持深度/保护区; 待处理/阻塞只标注, 不进确认版
+        de = de_items.get(d["id"])
+        if de and de.get("points"):
+            if de.get("status") == "confirmed":
+                pts = " → ".join("%s@%.2f" % (fmt_tc(q["t"]), q["g"]) for q in de["points"])
+                span_txt = "[%s–%s]" % (fmt_tc(de["span"][0]), fmt_tc(de["span"][1])) \
+                    if de.get("span") else ""
+                prot = "  人工保护区: " + "、".join(str(x) for x in de.get("protected") or []) \
+                    if de.get("protected") else ""
+                why = "  人工理由: " + de["accepted_reason"] if de.get("accepted_reason") else ""
+                L.append("    原声让位: 已确认 %s 关键点: %s%s%s" % (span_txt, pts, prot, why))
+            else:
+                note = "待处理(未确认,包络不参与混音/复演)"
+                if de_blocked.get(d["id"]):
+                    note += " 阻塞: " + "、".join(de_blocked[d["id"]])
+                if de.get("accepted_reason"):
+                    note += " 人工留痕(不改状态): " + de["accepted_reason"]
+                L.append("    原声让位: " + note)
         # 旁白拼接: 确认版给出来源与切点; 待处理/阻塞方案只标注, 合成不进确认版
         if narr and narr.get("splice"):
             spi = narr["splice"]

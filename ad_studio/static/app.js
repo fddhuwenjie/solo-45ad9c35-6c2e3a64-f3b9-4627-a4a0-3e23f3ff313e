@@ -5,6 +5,8 @@
 const DEFAULT_LV = { targetDb: -20, ceilingDb: -1, maxJumpDb: 3, minSpeech: 0.3,
                      minGainDb: -14, maxGainDb: 15.6 };
 const DEFAULT_SPL = { zeroxMs: 2, gapWarnS: 0.05, seamCeilingDb: -1 };
+const DEFAULT_DE = { minGain: 0.05, maxGain: 1.0, maxSlopePerSec: 6.0,
+                     restoreTol: 0.02, protectDuckMin: 0.92 };
 const S = {
   projectId: null,
   source: null,          // {name,duration,framerate,channels,peaks}
@@ -19,6 +21,13 @@ const S = {
   spliceReport: null,    // 后端最近一次拼接校审报告
   spliceResolved: {},    // descId -> 确认版合成片段 {id,name,duration,levels,splice}
   spTimer: null,
+  duckenv: { settings: { ...DEFAULT_DE }, items: {} }, // 原声让位包络(points/protected/status)
+  duckReport: null,      // 后端最近一次包络校审报告
+  deTimer: null,
+  dePrevConfirmed: {},   // descId -> 上一已确认关键点(供 C 上一修订循环比较)
+  deExpand: null,        // 主时间轴上展开包络编辑的描述卡
+  deDrag: null,          // 关键点/控制条拖拽暂态
+  dePlay: null,          // A/B/C 循环试听节点 {mode, nodes}
   abAudio: null,         // {descId, mode, nodes, start, a, b}
   issues: [],
   undoStack: [],
@@ -82,8 +91,15 @@ async function loadProject(pid) {
                  items: st.leveling.items || {} };
   S.splice = { settings: { ...DEFAULT_SPL, ...((st.splice || {}).settings || {}) },
                items: (st.splice || {}).items || {} };
+  S.duckenv = { settings: { ...DEFAULT_DE, ...((st.duckenv || {}).settings || {}) },
+                items: (st.duckenv || {}).items || {} };
   S.spliceResolved = st.spliceResolved || {};
   S.spliceReport = null;
+  S.dePlay = null;
+  S.duckReport = null; S.deExpand = null; S.deDrag = null; stopDePlay();
+  S.dePrevConfirmed = {};
+  for (const [did, it] of Object.entries(S.duckenv.items))
+    if (it.status === "confirmed" && it.points) S.dePrevConfirmed[did] = it.points.map(q => ({ ...q }));
   spEd.did = null; spEd.sel = null; spStop();
   S.lvReport = null; S.abAudio = null;
   S.issues = []; S.undoStack = []; S.loopRegion = null; S.playhead = 0;
@@ -101,6 +117,7 @@ async function loadProject(pid) {
   renderLeveling(); renderSplice();
   ensureLevelCurves().then(computeLeveling);
   if (Object.keys(S.splice.items).length) computeSplice();
+  if (Object.keys(S.duckenv.items).length) computeDuckenv();
   ["btnExportScript", "btnExportReplay"].forEach(id => $(id).disabled = false);
   $("btnExportMix").disabled = false;
 }
@@ -228,13 +245,19 @@ function renderDescList() {
         : `<span class="badge warn">估算 ${dur.toFixed(2)}s</span>`;
     const spBadge = !spRes && spPlan && (spPlan.segments || []).length
       ? `<span class="badge warn">拼接待处理</span>` : "";
+    const dePlan = S.duckenv.items[d.id];
+    const deBadge = dePlan && (dePlan.points || []).length
+      ? (dePlan.status === "confirmed"
+          ? `<span class="badge ok">让位已确认</span>`
+          : `<span class="badge warn">让位待处理</span>`) : "";
     div.innerHTML = `
-      <div class="text"><b>${d.id}</b> ${d.text || ""} ${badge}${spBadge}
+      <div class="text"><b>${d.id}</b> ${d.text || ""} ${badge}${spBadge}${deBadge}
         <span class="badge ${rate > S.settings.maxRate ? "bad" : "ok"}">${rate.toFixed(1)}字/s</span></div>
       <div class="row">
         <label>旁白 <select class="narr-sel"><option value="">(未绑定)</option></select></label>
         <label>起点 <input class="tc mono" value="${fmtTC(p ? p.start : (d.start || 0))}"></label>
         <label><input type="checkbox" class="duck"> 局部压低原声</label>
+        <button class="go-duckenv" title="原声让位包络: 拖关键点调渐入/保持/恢复/深度,锁对白/门铃保护区">〰 让位包络</button>
         <label><input type="checkbox" class="abridged" ${p && p.abridged ? "checked" : ""}> 缩写稿</label>
         <button class="auto-place">自动找空档</button>
         <button class="go-splice" title="多版本拼接: 挂接多版录音,切分取段合成">🧩 拼接</button>
@@ -272,6 +295,14 @@ function renderDescList() {
       else ensurePlacement(d).start = t;
       afterEdit();
     });
+    div.querySelector(".go-duckenv").addEventListener("click", () => {
+      deEnsure(d.id);
+      S.deExpand = S.deExpand === d.id ? null : d.id;
+      stopDePlay();
+      resizeCanvas(); draw();
+      renderDuckBar();
+      if (S.deExpand) $("waveScroll").scrollIntoView({ behavior: "smooth", block: "center" });
+    });
     div.querySelector(".go-splice").addEventListener("click", () => {
       spEd.did = d.id;
       renderSplice();
@@ -284,9 +315,11 @@ function renderDescList() {
 function afterEdit() {
   renderDescList(); draw(); runChecks(); savePlacements(); AudioEngine.invalidateMix();
   renderLeveling(); scheduleLeveling(); renderSplice(); scheduleSplice();
+  renderDuckBar(); scheduleDuckenv();
 }
 function pushUndo() {
-  S.undoStack.push(JSON.stringify({ p: S.placements, l: S.leveling.items, s: S.splice.items }));
+  S.undoStack.push(JSON.stringify({ p: S.placements, l: S.leveling.items, s: S.splice.items,
+                                    e: S.duckenv.items }));
   if (S.undoStack.length > 50) S.undoStack.shift();
 }
 $("btnUndo").addEventListener("click", () => {
@@ -294,15 +327,21 @@ $("btnUndo").addEventListener("click", () => {
   if (!s) return;
   const u = JSON.parse(s);
   S.placements = u.p; S.leveling.items = u.l || {}; S.splice.items = u.s || {};
+  S.duckenv.items = u.e || {};
   afterEdit();
 });
 
 // ---------------------------------------------------------------- 波形时间轴
 const canvas = $("wave");
 const ctx2d = canvas.getContext("2d");
-const LANES = { scene: 0, key: 1, dlg: 2, wave: 3, card: 4 };
-const LANE_H = { top: 46, dlg: 26, wave: 110, card: 46, bottom: 8 };
-const CANVAS_H = LANE_H.top + LANE_H.dlg + LANE_H.wave + LANE_H.card + LANE_H.bottom;
+const LANES = { scene: 0, key: 1, dlg: 2, wave: 3, card: 4, duck: 5 };
+const LANE_H = { top: 46, dlg: 26, wave: 110, card: 46, duck: 86, bottom: 8 };
+function deOn() { return !!S.deExpand && S.source; }
+function canvasH() {
+  return LANE_H.top + LANE_H.dlg + LANE_H.wave + LANE_H.card
+       + (deOn() ? LANE_H.duck : 0) + LANE_H.bottom;
+}
+const CANVAS_H = canvasH(); // 仅供初始引用; 实际高度一律用 canvasH()
 
 function t2x(t) { return t * S.pxPerSec; }
 function x2t(x) { return x / S.pxPerSec; }
@@ -310,25 +349,34 @@ function x2t(x) { return x / S.pxPerSec; }
 function resizeCanvas() {
   const dur = S.source ? S.source.duration : 60;
   const w = Math.max(600, Math.ceil(dur * S.pxPerSec) + 40);
+  const h = canvasH();
   const dpr = window.devicePixelRatio || 1;
   canvas.style.width = w + "px";
-  canvas.style.height = CANVAS_H + "px";
+  canvas.style.height = h + "px";
   canvas.width = w * dpr;
-  canvas.height = CANVAS_H * dpr;
+  canvas.height = h * dpr;
   ctx2d.setTransform(dpr, 0, 0, dpr, 0, 0);
   draw();
 }
 
+// 各泳道 y 坐标(包络轨展开时动态下移)
+function laneY() {
+  const yDlg = LANE_H.top, yWave = yDlg + LANE_H.dlg, yCard = yWave + LANE_H.wave;
+  const yDuck = yCard + LANE_H.card;
+  return { yDlg, yWave, yCard, yDuck, bottom: yDuck + (deOn() ? LANE_H.duck : 0) };
+}
+
 function draw() {
   const w = canvas.width / (window.devicePixelRatio || 1);
-  ctx2d.clearRect(0, 0, w, CANVAS_H);
+  const CH = canvasH();
+  ctx2d.clearRect(0, 0, w, CH);
   if (!S.source) {
     ctx2d.fillStyle = "#7f8ca0";
     ctx2d.fillText("请先载入正片 WAV", 20, 40);
     return;
   }
   const dur = S.source.duration;
-  const yDlg = LANE_H.top, yWave = yDlg + LANE_H.dlg, yCard = yWave + LANE_H.wave;
+  const { yDlg, yWave, yCard, yDuck } = laneY();
 
   // 时间刻度
   ctx2d.fillStyle = "#5b6878";
@@ -361,8 +409,8 @@ function draw() {
   ctx2d.fillStyle = "#8a6bd6";
   for (const s of S.scenes) {
     const x = t2x(s.time);
-    ctx2d.fillRect(x, 0, 2, yCard + LANE_H.card);
-    ctx2d.fillText(s.label || "", x + 4, CANVAS_H - 4);
+    ctx2d.fillRect(x, 0, 2, CH);
+    ctx2d.fillText(s.label || "", x + 4, CH - 4);
   }
 
   // 波形
@@ -401,7 +449,11 @@ function draw() {
     const cd = cardDur(d);
     const x = t2x(p.start), wdt = Math.max(14, t2x(cd));
     const hasIssue = S.issues.some(i => i.descId === d.id);
-    ctx2d.fillStyle = hasIssue ? "rgba(255,107,107,.9)" : "rgba(77,163,255,.9)";
+    const deIt = S.duckenv.items[d.id];
+    const deOn2 = deIt && (deIt.points || []).length;
+    ctx2d.fillStyle = hasIssue ? "rgba(255,107,107,.9)"
+      : deOn2 ? (deIt.status === "confirmed" ? "rgba(95,214,138,.9)" : "rgba(255,184,77,.9)")
+      : "rgba(77,163,255,.9)";
     ctx2d.fillRect(x, yCard, wdt, LANE_H.card - 8);
     if (!p.narration_id) {  // 未绑定旁白: 斜纹提示估算
       ctx2d.fillStyle = "rgba(0,0,0,.35)";
@@ -410,21 +462,143 @@ function draw() {
     ctx2d.fillStyle = "#06121f";
     ctx2d.font = "11px sans-serif";
     ctx2d.fillText(d.id, x + 3, yCard + 13);
-    if (p.duck) {
+    if (deOn2) {
+      ctx2d.fillText("〰", x + 3, yCard + 28);
+    } else if (p.duck) {
       ctx2d.fillStyle = "#ffb84d";
       ctx2d.fillText("压", x + 3, yCard + 27);
     }
   }
 
+  // 原声让位包络轨(展开时)
+  if (deOn()) drawDuckLane(yDuck, CH);
+
   // 播放头
   ctx2d.fillStyle = "#fff";
-  ctx2d.fillRect(t2x(S.playhead), 0, 1.5, CANVAS_H);
+  ctx2d.fillRect(t2x(S.playhead), 0, 1.5, CH);
+}
+
+// 关键点增益(与服务端 _seg_gain/逐帧插值同口径)
+function envGainAt(points, t) {
+  if (!points.length) return 1;
+  if (t <= points[0].t) return points[0].g;
+  if (t >= points[points.length - 1].t) return points[points.length - 1].g;
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i], b = points[i + 1];
+    if (t >= a.t && t <= b.t)
+      return b.t > a.t ? a.g + (b.g - a.g) * (t - a.t) / (b.t - a.t) : Math.min(a.g, b.g);
+  }
+  return 1;
+}
+
+function drawDuckLane(y0, CH) {
+  const h = LANE_H.duck;
+  const padL = 46, padT = 8, padB = 16;
+  const top = y0 + padT, bot = y0 + h - padB;
+  const dur = S.source.duration;
+  const xOf = (t) => t2x(t), yOf = (g) => bot - g * (bot - top);
+  // 底
+  ctx2d.fillStyle = "#0d1015";
+  ctx2d.fillRect(0, y0, canvas.width / (window.devicePixelRatio || 1), h);
+  ctx2d.strokeStyle = "#2e3745";
+  ctx2d.strokeRect(0.5, y0 + 0.5, canvas.width / (window.devicePixelRatio || 1), h - 1);
+  // 增益刻度(1.0/0.5/0)
+  ctx2d.fillStyle = "#5b6878"; ctx2d.font = "9px monospace";
+  for (const gv of [1.0, 0.5, 0.0]) {
+    const y = yOf(gv);
+    ctx2d.setLineDash([2, 3]); ctx2d.strokeStyle = "#222a36";
+    ctx2d.beginPath(); ctx2d.moveTo(padL, y); ctx2d.lineTo(xOf(dur), y); ctx2d.stroke();
+    ctx2d.setLineDash([]);
+    ctx2d.fillText(gv.toFixed(1), 6, y + 3);
+  }
+  ctx2d.fillText("原声", 6, y0 + 12); ctx2d.fillText("增益", 6, y0 + 23);
+  // 时间刻度
+  const step = S.pxPerSec >= 100 ? 1 : S.pxPerSec >= 50 ? 2 : 5;
+  for (let t = 0; t <= dur; t += step) ctx2d.fillText(t.toFixed(0), xOf(t) + 2, y0 + h - 4);
+
+  // 自动保护区(对白=蓝、不可遮盖关键声=红), 锁形提示
+  for (const dlg of S.dialogue) {
+    ctx2d.fillStyle = "rgba(77,163,255,.14)";
+    ctx2d.fillRect(xOf(dlg.start), top, xOf(dlg.end) - xOf(dlg.start), bot - top);
+  }
+  for (const k of S.keysounds) {
+    if (k.maskable !== false) continue;
+    ctx2d.fillStyle = "rgba(255,107,107,.20)";
+    ctx2d.fillRect(xOf(k.start), top, xOf(k.end) - xOf(k.start), bot - top);
+    ctx2d.fillStyle = "rgba(255,107,107,.85)"; ctx2d.font = "9px sans-serif";
+    ctx2d.fillText("🔒" + (k.label || ""), xOf(k.start) + 2, top + 10);
+  }
+
+  // 其他已确认包络(绿, 不可拖)与待处理包络(黄虚线)
+  for (const d of S.descriptions) {
+    if (d.id === S.deExpand) continue;
+    const it = S.duckenv.items[d.id];
+    if (!it || !(it.points || []).length) continue;
+    drawEnvPoly(it.points, it.status === "confirmed" ? "#5fd68a" : "#ffb84d",
+                it.status !== "confirmed", false);
+  }
+  // 当前展开卡: 人工保护区 + 多边形 + 关键点
+  const did = S.deExpand, it = S.duckenv.items[did];
+  const d = S.descriptions.find(x => x.id === did);
+  if (d) {
+    ctx2d.fillStyle = "rgba(255,184,77,.10)";
+    ctx2d.font = "10px sans-serif"; ctx2d.fillStyle = "#ffb84d";
+    ctx2d.fillText("〰 编辑: " + did + " " + (d.text || "").slice(0, 24), padL + 4, y0 + 12);
+  }
+  if (it) {
+    for (const z of (it.protected || [])) {
+      ctx2d.fillStyle = "rgba(255,184,77,.22)";
+      ctx2d.fillRect(xOf(z.start), top, xOf(z.end) - xOf(z.start), bot - top);
+      ctx2d.fillStyle = "#ffb84d"; ctx2d.font = "9px sans-serif";
+      ctx2d.fillText("🔒" + (z.label || "自定义"), xOf(z.start) + 2, top + 22);
+    }
+    const pts = it.points || [];
+    if (pts.length) drawEnvPoly(pts, "#4da3ff", false, true);
+    // 保持深度参考线(最深关键点)
+    if (pts.length) {
+      const gmin = Math.min(...pts.map(q => q.g));
+      ctx2d.setLineDash([5, 4]); ctx2d.strokeStyle = "rgba(255,184,77,.5)";
+      ctx2d.beginPath(); ctx2d.moveTo(padL, yOf(gmin)); ctx2d.lineTo(xOf(dur), yOf(gmin)); ctx2d.stroke();
+      ctx2d.setLineDash([]);
+    }
+  }
+
+  function drawEnvPoly(points, color, dashed, handles) {
+    if (!points.length) return;
+    // 填充(原声增益曲线以下)
+    ctx2d.beginPath();
+    ctx2d.moveTo(xOf(points[0].t), yOf(1));
+    ctx2d.lineTo(xOf(points[0].t), yOf(points[0].g));
+    for (let i = 1; i < points.length; i++)
+      ctx2d.lineTo(xOf(points[i].t), yOf(points[i].g));
+    ctx2d.lineTo(xOf(points[points.length - 1].t), yOf(1));
+    ctx2d.closePath();
+    ctx2d.fillStyle = color + "1f";
+    ctx2d.fill();
+    ctx2d.setLineDash(dashed ? [5, 3] : []);
+    ctx2d.strokeStyle = color; ctx2d.lineWidth = 1.6;
+    ctx2d.beginPath();
+    ctx2d.moveTo(xOf(points[0].t), yOf(points[0].g));
+    for (let i = 1; i < points.length; i++)
+      ctx2d.lineTo(xOf(points[i].t), yOf(points[i].g));
+    ctx2d.stroke();
+    ctx2d.setLineDash([]); ctx2d.lineWidth = 1;
+    if (handles) {
+      const dragIdx = S.deDrag && S.deDrag.idx;
+      points.forEach((q, i) => {
+        ctx2d.fillStyle = i === dragIdx ? "#fff" : color;
+        ctx2d.strokeStyle = "#06121f";
+        ctx2d.beginPath(); ctx2d.arc(xOf(q.t), yOf(q.g), i === dragIdx ? 6 : 4.5, 0, Math.PI * 2);
+        ctx2d.fill(); ctx2d.stroke();
+      });
+    }
+  }
 }
 
 // 拖动与寻址
 let drag = null; // {descId, offsetX} | 'seek'
 function hitCard(x, y) {
-  const yCard = LANE_H.top + LANE_H.dlg + LANE_H.wave;
+  const { yCard } = laneY();
   if (y < yCard || y > yCard + LANE_H.card) return null;
   for (const d of S.descriptions) {
     const p = S.placements[d.id];
@@ -434,9 +608,60 @@ function hitCard(x, y) {
   }
   return null;
 }
+
+// ---- 包络轨命中: 关键点(8px)/线段(3px, 双击新增在 dblclick 处理)/空白
+function deLaneGeom() {
+  const { yDuck } = laneY();
+  const padT = 8, padB = 16;
+  return { top: yDuck + padT, bot: yDuck + LANE_H.duck - padB,
+           y0: yDuck, h: LANE_H.duck };
+}
+function deHitPoint(x, y) {
+  if (!deOn()) return null;
+  const did = S.deExpand, it = S.duckenv.items[did];
+  const pts = it && it.points || [];
+  const { top, bot } = deLaneGeom();
+  if (y < top - 6 || y > bot + 6) return null;
+  let best = null, bd = 9;
+  pts.forEach((q, i) => {
+    const px = t2x(q.t), py = bot - q.g * (bot - top);
+    const d = Math.hypot(x - px, y - py);
+    if (d < bd) { bd = d; best = i; }
+  });
+  return best;
+}
+function deHitSegment(x, y) {
+  if (!deOn()) return null;
+  const did = S.deExpand, it = S.duckenv.items[did];
+  const pts = it && it.points || [];
+  const { top, bot } = deLaneGeom();
+  const t = x2t(x);
+  for (let i = 0; i < pts.length - 1; i++) {
+    if (t < pts[i].t || t > pts[i + 1].t) continue;
+    const g = envGainAt(pts, t), py = bot - g * (bot - top);
+    if (Math.abs(y - py) < 5) return i;
+  }
+  return null;
+}
+
 canvas.addEventListener("mousedown", (e) => {
   const r = canvas.getBoundingClientRect();
   const x = e.clientX - r.left, y = e.clientY - r.top;
+  // 包络轨优先: 拖关键点
+  if (deOn()) {
+    const { y0, h } = deLaneGeom();
+    if (y >= y0 && y <= y0 + h) {
+      const idx = deHitPoint(x, y);
+      if (idx != null) {
+        const did = S.deExpand;
+        pushUndo();
+        const q0 = { ...S.duckenv.items[did].points[idx] };
+        S.deDrag = { did, idx, q0, moved: false };
+        return;
+      }
+      return; // 轨内空白不触发寻址
+    }
+  }
   const d = hitCard(x, y);
   if (d) {
     pushUndo();
@@ -447,20 +672,78 @@ canvas.addEventListener("mousedown", (e) => {
     draw();
   }
 });
+
+// 双击包络线段/空白: 新增关键点; Shift+双击关键点: 删除
+canvas.addEventListener("dblclick", (e) => {
+  if (!deOn()) return;
+  const r = canvas.getBoundingClientRect();
+  const x = e.clientX - r.left, y = e.clientY - r.top;
+  const { y0, h, top, bot } = { ...deLaneGeom() };
+  if (y < y0 || y > y0 + h) return;
+  const did = S.deExpand, it = deEnsure(did);
+  const idx = deHitPoint(x, y);
+  if (idx != null && e.shiftKey && it.points.length > 4) {
+    pushUndo();
+    it.points.splice(idx, 1);
+    deTouch(did);
+    return;
+  }
+  if (deHitSegment(x, y) != null || (y >= top - 4 && y <= bot + 4)) {
+    pushUndo();
+    const t = Math.max(0, Math.min(S.source.duration, x2t(x)));
+    const g = Math.max(0, Math.min(1, (bot - y) / (bot - top)));
+    it.points.push({ t: +t.toFixed(3), g: +g.toFixed(3) });
+    it.points.sort((a, b) => a.t - b.t);
+    deTouch(did);
+  }
+});
+
 window.addEventListener("mousemove", (e) => {
-  if (!drag) return;
   const r = canvas.getBoundingClientRect();
   const x = e.clientX - r.left;
+  if (S.deDrag) {
+    const { top, bot } = deLaneGeom();
+    const it = S.duckenv.items[S.deDrag.did];
+    const q = it.points[S.deDrag.idx];
+    const t = Math.max(0, Math.min(S.source.duration, x2t(x)));
+    const gy = Math.max(top, Math.min(bot, e.clientY - r.top));
+    const g = Math.max(0, Math.min(1, (bot - gy) / (bot - top)));
+    // 0.02s 时间吸附, 与相邻关键点保持 0.02s 间距
+    const prev = it.points[S.deDrag.idx - 1], next = it.points[S.deDrag.idx + 1];
+    let nt = Math.round(t * 50) / 50;
+    if (prev) nt = Math.max(nt, prev.t + 0.02);
+    if (next) nt = Math.min(nt, next.t - 0.02);
+    q.t = +nt.toFixed(3);
+    q.g = +(Math.round(g * 100) / 100).toFixed(2);
+    S.deDrag.moved = true;
+    draw(); renderDuckBar(true);
+    return;
+  }
+  if (!drag) return;
   if (drag === "seek") {
     S.playhead = Math.min(Math.max(0, x2t(x)), S.source.duration);
     draw();
   } else {
     const p = S.placements[drag.descId];
-    p.start = Math.max(0, Math.round(x2t(x - drag.off) * 20) / 20); // 0.05s 吸附
+    const nt = Math.max(0, Math.round(x2t(x - drag.off) * 20) / 20); // 0.05s 吸附
+    const dt = nt - p.start;
+    p.start = nt;
+    // 移动描述卡时, 该卡包络关键点整体平移, 保持相对形状; 越界的点夹住
+    const deIt = S.duckenv.items[drag.descId];
+    if (deIt && (deIt.points || []).length) {
+      for (const q of deIt.points) q.t = +Math.max(0, Math.min(S.source.duration, q.t + dt)).toFixed(3);
+      deIt.status = "pending";
+    }
     draw();
   }
 });
 window.addEventListener("mouseup", () => {
+  if (S.deDrag) {
+    const { did } = S.deDrag;
+    S.deDrag = null;
+    deTouch(did);
+    return;
+  }
   if (drag && drag !== "seek") afterEdit();
   drag = null;
 });
@@ -575,6 +858,19 @@ function runChecks() {
       }
     }
   }
+  // 9. 原声让位: 阻塞(倒序/越界/过陡/未恢复/误压保护区/叠加过深)保持待处理
+  if (S.duckReport) {
+    for (const did of S.duckReport.order || []) {
+      const r = S.duckReport.items[did];
+      for (const e of r.errors.filter(x => x.sev === "bad")) {
+        issues.push({ type: "duckenv", descId: did, sev: "bad",
+          region: r.span && r.span[1] > r.span[0] ? r.span : [r.start, r.start + Math.max(0.4, r.duration)],
+          title: `让位包络阻塞 · ${did}`,
+          detail: e.msg + "。修正前包络不参与混音/脚本/复演。",
+          solutions: ["goDuckenv"] });
+      }
+    }
+  }
   S.issues = issues;
   renderIssues();
   draw();
@@ -597,7 +893,8 @@ function renderIssues() {
       </div>`;
     const ops = div.querySelector(".ops");
     const labels = { autoMove: "⇢ 移到空档", duck: "🔉 局部压低", abridge: "✂ 缩写稿",
-                     accept: "✔ 保留并记录", goLeveling: "🎚 去响度配平", goSplice: "🧩 去旁白拼接" };
+                     accept: "✔ 保留并记录", goLeveling: "🎚 去响度配平", goSplice: "🧩 去旁白拼接",
+                     goDuckenv: "〰 去让位包络" };
     for (const s of it.solutions) {
       const b = document.createElement("button");
       b.textContent = labels[s];
@@ -641,6 +938,14 @@ function applySolution(it, kind) {
     el.scrollIntoView({ behavior: "smooth", block: "center" });
     el.classList.add("flash");
     setTimeout(() => el.classList.remove("flash"), 1600);
+    return;
+  }
+  if (kind === "goDuckenv") {
+    deEnsure(it.descId);
+    S.deExpand = it.descId;
+    resizeCanvas(); draw(); renderDuckBar();
+    const el = $("waveScroll");
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
     return;
   }
   pushUndo();
@@ -1131,6 +1436,8 @@ function spTouch(did) {
   const plan = spPlan(did);
   plan.status = "pending";        // 内容变更须重新确认(后端同样强制)
   delete S.leveling.items[did];   // 合成变更, 该卡旧配平选区/增益失效
+  const deIt = S.duckenv.items[did];
+  if (deIt && deIt.status === "confirmed") deIt.status = "pending";
   AudioEngine.spliceBufs = {};
   scheduleSplice();
 }
@@ -1710,6 +2017,273 @@ $("spliceDesc").addEventListener("change", () => {
   renderSplice();
 });
 
+// ---------------------------------------------------------------- 原声让位包络
+// 方案: S.duckenv.items[did] = {points:[{t,g}], protected:[{start,end,label}],
+//   status, accepted_reason}; 确认前实时校审(与服务端 duckenv_report 同规则),
+//   阻塞不确认; 确认后包络驱动客户端混合预览与服务端 WAV/脚本/复演。
+function deItem(did) {
+  if (!S.duckenv.items[did]) S.duckenv.items[did] = { points: [], protected: [], status: "pending" };
+  return S.duckenv.items[did];
+}
+// 以旧版固定斜坡为模板生成初始四点(渐入/保持/恢复), 与服务端 duckenv_default_points 同形状
+function deDefaultPoints(did) {
+  const d = S.descriptions.find(x => x.id === did);
+  const p = S.placements[did] || { start: d ? d.start || 0 : 0 };
+  const dur = cardDur(d || { id: did });
+  const duckTo = +S.settings.duck_to, pad = +S.settings.duck_pad, ramp = 0.15;
+  const t0 = Math.max(0, p.start - pad), t3 = p.start + dur + pad;
+  const t1 = t0 + ramp, t2 = Math.max(t1, t3 - ramp);
+  return [{ t: +t0.toFixed(3), g: 1 }, { t: +t1.toFixed(3), g: duckTo },
+          { t: +t2.toFixed(3), g: duckTo }, { t: +t3.toFixed(3), g: 1 }];
+}
+function deEnsure(did) {
+  const it = deItem(did);
+  if (!(it.points || []).length) it.points = deDefaultPoints(did);
+  if (!Array.isArray(it.protected)) it.protected = [];
+  return it;
+}
+function deTouch(did) {
+  const it = deItem(did);
+  it.status = "pending";
+  AudioEngine.invalidateMix();
+  draw(); renderDuckBar();
+  scheduleDuckenv();
+}
+function scheduleDuckenv() {
+  clearTimeout(S.deTimer);
+  S.deTimer = setTimeout(computeDuckenv, 300);
+}
+async function computeDuckenv() {
+  clearTimeout(S.deTimer);
+  if (!S.projectId || !S.source) return;
+  try {
+    const r = await api(`/api/project/${S.projectId}/duckenv`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ settings: S.duckenv.settings, items: S.duckenv.items }),
+    });
+    if (r.plans) S.duckenv.items = r.plans.items || {};
+    S.duckReport = r.report;
+    renderDuckBar(); runChecks(); draw();
+    AudioEngine.invalidateMix();
+  } catch (e) { /* 网络抖动不阻塞编辑, 下次编辑重试 */ }
+}
+
+// ---- 控制条
+function deAutoZones() {
+  const zones = S.dialogue.map(g => ({ kind: "对白", start: g.start, end: g.end,
+                                      label: (g.text || "对白").slice(0, 12) }));
+  for (const k of S.keysounds)
+    if (k.maskable === false) zones.push({ kind: "关键声", start: k.start, end: k.end, label: k.label || "关键声" });
+  return zones;
+}
+function renderDuckBar(live) {
+  const bar = $("duckBar");
+  const did = S.deExpand;
+  if (!did || !S.source) { bar.style.display = "none"; return; }
+  bar.style.display = "flex";
+  const it = S.duckenv.items[did] || { points: [] };
+  const rep = S.duckReport && S.duckReport.items[did];
+  const bads = rep ? rep.errors.filter(e => e.sev === "bad") : [];
+  const warns = rep ? rep.errors.filter(e => e.sev === "warn") : [];
+  const hold = (it.points || []).length ? Math.min(...it.points.map(q => q.g)) : 1;
+  const holdDb = 20 * Math.log10(Math.max(hold, 1e-6));
+  const span = (it.points || []).length ? [it.points[0].t, it.points[it.points.length - 1].t] : null;
+  const dePlay = S.dePlay;
+  if (live) {
+    const m = bar.querySelector(".de-metrics");
+    if (m) m.innerHTML = `保持 <b>${hold.toFixed(2)}</b>(${holdDb.toFixed(1)} dB)
+      区间 <b class="mono">${span ? fmtTC(span[0]) : "—"}–${span ? fmtTC(span[1]) : "—"}</b>
+      <span class="${bads.length ? "bad" : "ok"}">${bads.length ? bads.length + " 个阻塞" : "✓ 可确认"}</span>`;
+    const errBox = bar.querySelector(".de-errs");
+    if (errBox) errBox.innerHTML = [...bads, ...warns].map(e =>
+      `<span class="de-err ${e.sev === "bad" ? "bad" : "warn"}">⛔ ${e.msg}</span>`).join("");
+    return;
+  }
+  const autoN = deAutoZones().length;
+  bar.innerHTML = `
+    <div class="de-col">
+      <div class="de-head">
+        <b>〰 原声让位 · ${did}</b>
+        <span class="badge ${it.status === "confirmed" ? "ok" : bads.length ? "bad" : "warn"}">
+          ${it.status === "confirmed" ? "已确认(驱动混音/脚本/复演)" : bads.length ? "待处理·" + bads.length + " 阻塞" : "待处理"}</span>
+        <span class="de-metrics small mono">保持 <b>${hold.toFixed(2)}</b>(${holdDb.toFixed(1)} dB)
+          区间 <b>${span ? fmtTC(span[0]) + "–" + fmtTC(span[1]) : "—"}</b>
+          <span class="${bads.length ? "bad" : "ok"}">${bads.length ? bads.length + " 个阻塞" : "✓ 可确认"}</span></span>
+      </div>
+      <div class="de-errs">${[...bads, ...warns].map(e =>
+        `<span class="de-err ${e.sev === "bad" ? "bad" : "warn"}">⛔ ${e.msg}</span>`).join("")}</div>
+      <div class="de-row">
+        <button class="de-a">A 原声</button>
+        <button class="de-b">B 当前方案</button>
+        <button class="de-c" ${S.dePrevConfirmed[did] ? "" : "disabled"}>C 上一修订</button>
+        <button class="de-stop">■</button>
+        <label class="small">保持深度
+          <input type="range" class="de-depth" min="${S.duckenv.settings.minGain}" max="1" step="0.01" value="${hold}">
+          <input type="number" class="de-depth-n" min="${S.duckenv.settings.minGain}" max="1" step="0.01" value="${hold.toFixed(2)}"></label>
+        <button class="de-reset" title="重置为与旧版固定压低同形状的四点包络">标准四点</button>
+        <button class="de-collapse">收起</button>
+      </div>
+      <div class="de-row small">
+        <span class="muted">拖圆点改渐入/保持/恢复/深度 · 双击线段加点 · Shift+双击圆点删点(至少4点)</span>
+      </div>
+    </div>
+    <div class="de-col de-protect">
+      <div class="small muted">自动保护区 ${autoN} 段(对白 + 不可遮盖关键声),误压即阻塞</div>
+      <div class="de-row">
+        <label class="small">人工保护区 <input type="text" class="de-p0 mono" placeholder="00:00:20.200" style="width:104px"> ~
+          <input type="text" class="de-p1 mono" placeholder="00:00:21.000" style="width:104px"></label>
+        <button class="de-addp">锁定保护区</button>
+      </div>
+      <div class="de-chips">${(it.protected || []).map((z, i) =>
+        `<span class="de-chip">🔒 ${fmtTC(z.start)}–${fmtTC(z.end)} ${z.label || ""} <b data-i="${i}">✕</b></span>`).join("")}</div>
+      <div class="de-row">
+        <input class="de-reason" placeholder="人工理由(确认时写入修订; 阻塞时仅留痕)" value="${it.accepted_reason || ""}">
+        <button class="de-confirm">${it.status === "confirmed" ? "重新确认" : "确认包络"}</button>
+        <button class="de-remove" title="拆除自定义包络, 该卡回到旧版固定压低">拆除</button>
+      </div>
+    </div>`;
+  bar.querySelector(".de-collapse").addEventListener("click", () => {
+    S.deExpand = null; stopDePlay(); resizeCanvas(); bar.style.display = "none";
+  });
+  bar.querySelector(".de-a").addEventListener("click", () => dePlayPreview("source"));
+  bar.querySelector(".de-b").addEventListener("click", () => dePlayPreview("current"));
+  bar.querySelector(".de-c").addEventListener("click", () => dePlayPreview("prev"));
+  bar.querySelector(".de-stop").addEventListener("click", stopDePlay);
+  const depth = bar.querySelector(".de-depth"), depthN = bar.querySelector(".de-depth-n");
+  const applyDepth = (v) => {
+    const it2 = deEnsure(did);
+    for (let i = 1; i < it2.points.length - 1; i++) it2.points[i].g = v;
+    it2.status = "pending"; depth.value = v; depthN.value = v;
+    deTouch(did);
+  };
+  depth.addEventListener("change", () => applyDepth(+depth.value));
+  depthN.addEventListener("change", () => applyDepth(+depthN.value));
+  bar.querySelector(".de-reset").addEventListener("click", () => {
+    pushUndo(); deItem(did).points = deDefaultPoints(did); deTouch(did);
+  });
+  bar.querySelector(".de-addp").addEventListener("click", () => {
+    const t0 = parseTC(bar.querySelector(".de-p0").value), t1 = parseTC(bar.querySelector(".de-p1").value);
+    if (!(t1 > t0)) { toast("保护区区间无效"); return; }
+    pushUndo();
+    deEnsure(did).protected.push({ start: +t0.toFixed(3), end: +t1.toFixed(3), label: "自定义" });
+    deTouch(did);
+  });
+  bar.querySelectorAll(".de-chip b").forEach(b => b.addEventListener("click", () => {
+    pushUndo();
+    deItem(did).protected.splice(+b.dataset.i, 1);
+    deTouch(did);
+  }));
+  bar.querySelector(".de-reason").addEventListener("change", (e) => {
+    deEnsure(did).accepted_reason = e.target.value.trim();
+  });
+  bar.querySelector(".de-confirm").addEventListener("click", () => deConfirm(did));
+  bar.querySelector(".de-remove").addEventListener("click", () => deRemove(did));
+  syncDePlayButtons();
+}
+
+async function deConfirm(did) {
+  stopDePlay();
+  await computeDuckenv(); // 先保存最新关键点
+  const reason = (document.querySelector(".de-reason") || {}).value || "";
+  // 记录上一确认版本, 供 C 上一修订比较
+  const old = S.duckenv.items[did];
+  if (old && old.status === "confirmed") S.dePrevConfirmed[did] = (old.points || []).map(q => ({ ...q }));
+  const r = await api(`/api/project/${S.projectId}/duckenvconfirm`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ desc_id: did, accepted_reason: reason.trim() }),
+  });
+  if (r.plans) S.duckenv.items = r.plans.items || {};
+  S.duckReport = r.report;
+  if ((r.confirmed || []).includes(did))
+    S.dePrevConfirmed[did] = (r.plans.items[did].points || []).map(q => ({ ...q }));
+  const st = await api(`/api/project/${S.projectId}/state`);
+  renderRevisions(st.revisions);
+  renderDescList(); renderDuckBar(); runChecks(); draw();
+  AudioEngine.invalidateMix();
+  if ((r.confirmed || []).includes(did)) toast(`已确认 ${did} 让位包络`);
+  else {
+    const b = (r.blocked || [])[0];
+    toast(`${did} 阻塞待处理${b ? ":" + b.codes.join(",") : ""}${b && b.reasonLogged ? "(理由已留痕, 不改状态)" : ""}`);
+  }
+}
+async function deRemove(did) {
+  pushUndo();
+  delete S.duckenv.items[did];
+  stopDePlay();
+  await computeDuckenv();
+  if (S.deExpand === did) { S.deExpand = null; resizeCanvas(); $("duckBar").style.display = "none"; }
+  toast(`已拆除 ${did} 让位包络,该卡按旧版固定压低播放`);
+}
+
+// ---- A/B/C 循环试听(原声 / 当前方案 / 上一修订; Web Audio 离线渲染源声带包络)
+function stopDePlay() {
+  if (S.dePlay) {
+    for (const n of S.dePlay.nodes) { try { n.stop(); } catch (e) {} try { n.disconnect(); } catch (e) {} }
+    S.dePlay = null;
+  }
+  syncDePlayButtons();
+}
+function syncDePlayButtons() {
+  const modeMap = { a: "source", b: "current", c: "prev" };
+  for (const m of ["a", "b", "c"]) {
+    const btn = document.querySelector(`#duckBar .de-${m}`);
+    if (btn) btn.classList.toggle("on", !!(S.dePlay && S.dePlay.mode === modeMap[m]));
+  }
+}
+async function deBuildPreviewBuffer(points) {
+  const src = await AudioEngine.loadSource();
+  const ctx = AudioEngine.ensureCtx();
+  const nch = src.numberOfChannels, sr = src.sampleRate, n = src.length;
+  const out = ctx.createBuffer(nch, n, sr);
+  if (!points || !points.length) {
+    for (let c = 0; c < nch; c++) out.getChannelData(c).set(src.getChannelData(c));
+    return out;
+  }
+  // 其他已确认包络仍生效(听到的是除本卡编辑外的成片底声), 本卡用 points 替换
+  const others = [];
+  for (const [did2, it] of Object.entries(S.duckenv.items)) {
+    if (did2 === S.deExpand || it.status !== "confirmed" || !(it.points || []).length) continue;
+    others.push(it.points);
+  }
+  for (let c = 0; c < nch; c++) {
+    const sd = src.getChannelData(Math.min(c, src.numberOfChannels - 1));
+    const od = out.getChannelData(c);
+    for (let i = 0; i < n; i++) {
+      const t = i / sr;
+      let g = envGainAt(points, t);
+      for (const op of others) { const v = envGainAt(op, t); if (v < g) g = v; }
+      od[i] = sd[i] * g;
+    }
+  }
+  return out;
+}
+async function dePlayPreview(mode) {
+  stopDePlay();
+  const did = S.deExpand;
+  const it = S.duckenv.items[did] || deEnsure(did);
+  let points, label;
+  if (mode === "source") { points = null; label = "原声"; }
+  else if (mode === "current") { points = it.points; label = "当前方案"; }
+  else { points = S.dePrevConfirmed[did]; label = "上一修订"; }
+  if (!points || !points.length) {
+    if (mode !== "source") { toast(mode === "prev" ? "还没有已确认的上一修订可比较" : "请先拖出关键点"); return; }
+  }
+  const spanPts = points || it.points;
+  if (!spanPts || !spanPts.length) { toast("该卡还没有包络区间"); return; }
+  const pad = 0.4;
+  const a = Math.max(0, spanPts[0].t - pad), b = Math.min(S.source.duration, spanPts[spanPts.length - 1].t + pad);
+  const buf = await deBuildPreviewBuffer(points);
+  const ctx = AudioEngine.ensureCtx();
+  if (ctx.state === "suspended") await ctx.resume();
+  const srcN = ctx.createBufferSource();
+  srcN.buffer = buf; srcN.loop = true; srcN.loopStart = a; srcN.loopEnd = b;
+  srcN.connect(ctx.destination); srcN.start(0, a);
+  S.dePlay = { mode, nodes: [srcN] };
+  // 同步播放头/循环框
+  S.loopRegion = { a, b, duck: did };
+  syncDePlayButtons(); draw();
+}
+
 // ---------------------------------------------------------------- 播放引擎(Web Audio)
 const AudioEngine = {
   ctx: null, srcBuf: null, narrBufs: {}, mixBuf: null, spliceBufs: {}, nodes: [], playing: false,
@@ -1773,7 +2347,10 @@ const AudioEngine = {
       jobs.push({ p, _did: d.id, nb: await this.effectiveNarr(d) });
     }
     const env = new Float32Array(n).fill(1);
-    for (const { p, nb } of jobs) {
+    for (const { p, _did, nb } of jobs) {
+      // 已确认自定义让位包络接管该卡: 不走固定斜坡(与服务端 render_mix 同口径)
+      const de = S.duckenv.items[_did];
+      if (de && de.status === "confirmed" && (de.points || []).length) continue;
       if (!p.duck) continue;
       const dur = nb.duration;
       const f0 = Math.max(0, Math.floor((p.start - pad) * sr));
@@ -1783,6 +2360,18 @@ const AudioEngine = {
         let g = duckTo;
         if (f - f0 < r) g = 1 - (1 - duckTo) * (f - f0) / r;
         else if (f1 - f < r) g = 1 - (1 - duckTo) * (f1 - f) / r;
+        if (g < env[f]) env[f] = g;
+      }
+    }
+    // 已确认自定义包络: 逐帧 min 叠加(前端预览, 与 DuckEnvComposer 同语义)
+    for (const { _did } of jobs) {
+      const de = S.duckenv.items[_did];
+      if (!de || de.status !== "confirmed" || !(de.points || []).length) continue;
+      const pts = de.points;
+      const f0 = Math.max(0, Math.floor(pts[0].t * sr));
+      const f1 = Math.min(n, Math.ceil(pts[pts.length - 1].t * sr) + 1);
+      for (let f = f0; f < f1; f++) {
+        const g = envGainAt(pts, f / sr);
         if (g < env[f]) env[f] = g;
       }
     }
@@ -1882,12 +2471,12 @@ const AudioEngine = {
 
 $("btnPlay").addEventListener("click", () => {
   if (!S.source) return;
-  stopLvPlay();
+  stopLvPlay(); stopDePlay();
   S.loopRegion = null;
   renderIssues(); draw();
   AudioEngine.play($("playMode").value, S.playhead);
 });
-$("btnStop").addEventListener("click", () => { AudioEngine.stop(); S.loopRegion = null; stopLvPlay(); renderIssues(); draw(); });
+$("btnStop").addEventListener("click", () => { AudioEngine.stop(); S.loopRegion = null; stopLvPlay(); stopDePlay(); renderIssues(); draw(); });
 
 // ---------------------------------------------------------------- 混音渲染与导出
 $("btnRenderMix").addEventListener("click", async () => {
