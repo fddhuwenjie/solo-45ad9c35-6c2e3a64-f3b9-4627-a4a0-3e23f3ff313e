@@ -361,7 +361,8 @@ class ReplayLeakTests(unittest.TestCase):
         rep = self.save()
         status, r = self.confirm_all("")
         self.assertEqual(status, "200 OK")
-        self.assertEqual(r["confirmed"], [])
+        # 阻塞四段一个都不能确认(演示项目另有健康段 ad5, 确认它不影响本断言)
+        self.assertEqual([d for d in r["confirmed"] if d in self.BLOCK], [])
         self.assertEqual(len(r["blocked"]), 4)
         self.assertFalse(any(b["reasonLogged"] for b in r["blocked"]))
         self.assert_replay_clean(self.replay(), "")
@@ -371,7 +372,7 @@ class ReplayLeakTests(unittest.TestCase):
         reason = "保留现场动态"
         status, r = self.confirm_all(reason)
         self.assertEqual(status, "200 OK")
-        self.assertEqual(r["confirmed"], [])
+        self.assertEqual([d for d in r["confirmed"] if d in self.BLOCK], [])
         self.assertTrue(all(b["reasonLogged"] for b in r["blocked"]))
         # DB 里草稿增益保留(供继续编辑), 但状态 pending
         st = server.get_state(self.pid)
@@ -383,8 +384,10 @@ class ReplayLeakTests(unittest.TestCase):
         # 复演导出必须剥除增益, 仅留理由痕迹
         self.assert_replay_clean(self.replay(), reason)
         # 理由确实写进修订(留痕), 但摘要表明仍待处理
+        # (演示项目健康段 ad5 会被确认并写确认修订, 只统计阻塞留痕)
         _s, rows = j("GET", self.base + "/revisions")
-        keep = [x for x in rows if x["rationale"] == reason]
+        keep = [x for x in rows
+                if x["rationale"] == reason and "保持待处理" in x["summary"]]
         self.assertEqual(len(keep), 4)
         self.assertTrue(all("保持待处理" in x["summary"] for x in keep))
 

@@ -1063,9 +1063,12 @@ function stopLvPlay() {
 }
 async function lvPlay(did, mode) {
   stopLvPlay();
-  const p = S.placements[did];
-  const nid = p.narration_id;
-  const buf = await AudioEngine.loadNarr(nid);
+  const d = S.descriptions.find(x => x.id === did);
+  // 确认版拼接: 试听合成片段; 否则整段绑定
+  const buf = S.spliceResolved[did]
+    ? await buildSpliceBuffer(did)
+    : await AudioEngine.loadNarr(S.placements[did].narration_id);
+  if (!buf) return;
   const it = S.leveling.items[did] || {};
   const report = S.lvReport && S.lvReport.items[did];
   let ranges = lvRanges(did);
@@ -1091,8 +1094,8 @@ function drawLvCurveForDid(did) {
   const div = document.querySelector(`.lv-item[data-did="${did}"]`);
   if (!div) return;
   const d = S.descriptions.find(x => x.id === did);
-  const n = S.narrations.find(x => String(x.id) === String(S.placements[did].narration_id));
-  drawLvCurve(div.querySelector(".lv-canvas"), did, n);
+  const n = d ? effNarrOf(d) : null;
+  if (n) drawLvCurve(div.querySelector(".lv-canvas"), did, n);
 }
 
 // ---- 配平参数
@@ -1104,11 +1107,614 @@ function drawLvCurveForDid(did) {
   scheduleLeveling();
 }));
 
+// ---------------------------------------------------------------- 旁白多版本拼接
+// 方案: S.splice.items[descId] = {takes:[录音id], anchors:{录音id:秒},
+//   segments:[{take_id,in,out,xfade,gap}], status}; 确认后合成片段经 spliceResolved
+// 接管该卡时长/配平/混合预览, 服务端 render_splice 为导出口径。
+
+function spPlan(did) {
+  if (!S.splice.items[did]) {
+    const p = S.placements[did] || {};
+    S.splice.items[did] = { takes: p.narration_id ? [p.narration_id] : [],
+                            anchors: {}, segments: [], status: "pending" };
+  }
+  return S.splice.items[did];
+}
+// 渲染用只读视图: 不创建方案(仅查看不产生副作用, 编辑操作才经 spPlan 创建)
+function spView(did) {
+  if (S.splice.items[did]) return S.splice.items[did];
+  const p = S.placements[did] || {};
+  return { takes: p.narration_id ? [p.narration_id] : [],
+           anchors: {}, segments: [], status: "pending" };
+}
+function spTouch(did) {
+  const plan = spPlan(did);
+  plan.status = "pending";        // 内容变更须重新确认(后端同样强制)
+  delete S.leveling.items[did];   // 合成变更, 该卡旧配平选区/增益失效
+  AudioEngine.spliceBufs = {};
+  scheduleSplice();
+}
+function scheduleSplice() {
+  clearTimeout(S.spTimer);
+  S.spTimer = setTimeout(computeSplice, 300);
+}
+async function computeSplice() {
+  clearTimeout(S.spTimer);
+  if (!S.projectId || !S.source) return;
+  $("spStatus").textContent = "校审中…";
+  try {
+    const r = await api(`/api/project/${S.projectId}/splice`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ settings: S.splice.settings, items: S.splice.items }),
+    });
+    S.spliceReport = r.report;
+    if (r.plans) S.splice.items = r.plans.items || {};
+    S.spliceResolved = r.resolved || {};
+    const nb = (r.report && r.report.blocked || []).length;
+    $("spStatus").textContent = nb ? `${nb} 个拼接方案阻塞待处理` : "";
+    renderSplice(); renderDescList(); renderLeveling(); runChecks();
+    AudioEngine.invalidateMix(); draw();
+  } catch (e) {
+    $("spStatus").textContent = e.message;
+  }
+}
+
+// ---- 拼接轨布局(与服务端 render_splice 同算法): 段 i 起点 = 前段终点 - xfade + gap
+function spLayout(plan) {
+  let pos = 0;
+  return (plan.segments || []).map((sg, i) => {
+    const dur = (+sg.out || 0) - (+sg.in || 0);
+    const start = i === 0 ? 0 : Math.max(0, pos - (+sg.xfade || 0) + (+sg.gap || 0));
+    pos = start + dur;
+    return { sg, i, start, end: start + dur };
+  });
+}
+const SP_COLORS = ["#4da3ff", "#5fd68a", "#ffb84d", "#d68bd6", "#6bd6c9", "#ff8f6b"];
+function spColor(plan, takeId) {
+  const idx = (plan.takes || []).map(String).indexOf(String(takeId));
+  return SP_COLORS[Math.max(0, idx) % SP_COLORS.length];
+}
+const spTakeName = (takeId) => {
+  const n = S.narrations.find(x => String(x.id) === String(takeId));
+  return n ? n.name : `#${takeId}(缺失)`;
+};
+
+// ---- 前端合成(线性交叉淡化, 与服务端 render_splice 一致), 供试听与混合预览
+async function buildSpliceBuffer(did) {
+  const plan = S.splice.items[did];
+  if (!plan || !(plan.segments || []).length) return null;
+  const key = JSON.stringify(plan.segments);
+  const hit = AudioEngine.spliceBufs[did];
+  if (hit && hit.key === key) return hit.buf;
+  const segs = [];
+  for (const sg of plan.segments) {
+    const buf = await AudioEngine.loadNarr(sg.take_id);
+    segs.push({ buf, in: +sg.in || 0, out: +sg.out || 0,
+                xfade: +sg.xfade || 0, gap: +sg.gap || 0 });
+  }
+  const sr = segs[0].buf.sampleRate, nch = segs[0].buf.numberOfChannels;
+  let pos = 0;
+  const lays = segs.map((s, i) => {
+    const f0 = Math.max(0, Math.min(s.buf.length, Math.round(s.in * sr)));
+    const f1 = Math.max(f0, Math.min(s.buf.length, Math.round(s.out * sr)));
+    const frames = f1 - f0;
+    const start = i === 0 ? 0 : Math.max(0, pos - Math.round(s.xfade * sr) + Math.round(s.gap * sr));
+    pos = start + frames;
+    return { ...s, f0, frames, start };
+  });
+  const ctx = AudioEngine.ensureCtx();
+  const out = ctx.createBuffer(nch, Math.max(1, pos), sr);
+  for (let k = 0; k < lays.length; k++) {
+    const L = lays[k];
+    const xfIn = k > 0 ? Math.round(L.xfade * sr) : 0;
+    const xfOut = k + 1 < lays.length ? Math.round(lays[k + 1].xfade * sr) : 0;
+    for (let c = 0; c < nch; c++) {
+      const sd = L.buf.getChannelData(c), od = out.getChannelData(c);
+      for (let j = 0; j < L.frames; j++) {
+        let w = 1;
+        if (xfIn > 0 && j < xfIn) w = j / xfIn;
+        if (xfOut > 0) {
+          const tail = L.frames - j;
+          if (tail <= xfOut) w = Math.min(w, tail / xfOut);
+        }
+        od[L.start + j] += sd[L.f0 + j] * w;
+      }
+    }
+  }
+  AudioEngine.spliceBufs[did] = { key, buf: out };
+  return out;
+}
+
+// ---- 试听: A 原录 / B 候选选区 / C 合成结果(及各段单听)
+function spStop() {
+  if (!spEd.play) return;
+  for (const n of spEd.play.nodes) { try { n.stop(); } catch (e) {} try { n.disconnect(); } catch (e) {} }
+  spEd.play = null;
+  syncSpPlayButtons();
+}
+function syncSpPlayButtons() {
+  document.querySelectorAll("#spliceEditor [data-sp-play]").forEach(btn => {
+    const on = spEd.play && spEd.play.kind === btn.dataset.spPlay &&
+               String(spEd.play.arg == null ? "" : spEd.play.arg) === (btn.dataset.spArg || "");
+    btn.classList.toggle("on", !!on);
+  });
+}
+async function spPlay(kind, arg) {
+  spStop();
+  const did = spEd.did;
+  let buf = null, a = 0, b = null;
+  if (kind === "take") {
+    buf = await AudioEngine.loadNarr(arg);
+  } else if (kind === "sel") {
+    if (!spEd.sel) return;
+    buf = await AudioEngine.loadNarr(spEd.sel.takeId);
+    a = spEd.sel.a; b = spEd.sel.b;
+  } else if (kind === "seg") {
+    const plan = S.splice.items[did];
+    const sg = plan && (plan.segments || [])[arg];
+    if (!sg) return;
+    buf = await AudioEngine.loadNarr(sg.take_id);
+    a = +sg.in || 0; b = +sg.out || 0;
+  } else if (kind === "comp") {
+    buf = await buildSpliceBuffer(did);
+  }
+  if (!buf) return;
+  const ctx = AudioEngine.ensureCtx();
+  if (ctx.state === "suspended") await ctx.resume();
+  const src = ctx.createBufferSource();
+  src.buffer = buf; src.connect(ctx.destination);
+  if (b != null) src.start(0, a, Math.max(0.01, b - a));
+  else src.start(0, a);
+  spEd.play = { kind, arg, nodes: [src] };
+  src.onended = () => { if (spEd.play && spEd.play.nodes.includes(src)) spStop(); };
+  syncSpPlayButtons();
+}
+
+// ---- 波形峰值(从 AudioBuffer 计算, 供 take 波形绘制)
+const spPeaks = {};
+function bufferPeaks(buf, buckets = 1200) {
+  const n = buf.length, ch = buf.getChannelData(0);
+  const mins = [], maxs = [];
+  const step = n / buckets;
+  for (let b = 0; b < buckets; b++) {
+    const lo = Math.floor(b * step), hi = Math.min(n, Math.max(lo + 1, Math.floor((b + 1) * step)));
+    let mn = 1, mx = -1;
+    for (let i = lo; i < hi; i++) { const v = ch[i]; if (v < mn) mn = v; if (v > mx) mx = v; }
+    mins.push(mn); maxs.push(mx);
+  }
+  return { duration: buf.duration, mins, maxs };
+}
+async function spEnsureBuf(takeId) {
+  const buf = await AudioEngine.loadNarr(takeId);
+  if (!spPeaks[takeId]) spPeaks[takeId] = bufferPeaks(buf);
+  return buf;
+}
+
+// ---- 编辑器渲染
+function renderSplice() {
+  const sel = $("spliceDesc");
+  const prev = spEd.did;
+  sel.innerHTML = "";
+  for (const d of S.descriptions) {
+    const o = document.createElement("option");
+    o.value = d.id;
+    const plan = S.splice.items[d.id];
+    const mark = S.spliceResolved[d.id] ? "✓已确认"
+               : (plan && (plan.segments || []).length ? "…待处理" : "");
+    o.textContent = `${d.id} ${mark} ${(d.text || "").slice(0, 16)}`;
+    sel.appendChild(o);
+  }
+  if (!S.descriptions.length) {
+    $("spliceEditor").innerHTML = `<div class="muted small" style="padding:6px">载入描述稿后可拼接</div>`;
+    return;
+  }
+  spEd.did = (prev && S.descriptions.some(d => d.id === prev)) ? prev : S.descriptions[0].id;
+  sel.value = spEd.did;
+  renderSpEditor();
+}
+
+function renderSpEditor() {
+  const box = $("spliceEditor");
+  box.innerHTML = "";
+  const did = spEd.did;
+  if (!did) return;
+  const plan = spView(did);
+  const rep = S.spliceReport && S.spliceReport.items[did];
+  const resolved = S.spliceResolved[did];
+
+  // ---- 候选录音(挂接多版 PCM WAV)
+  const takesDiv = document.createElement("div");
+  takesDiv.className = "sp-takes";
+  for (const takeId of plan.takes || []) {
+    const row = document.createElement("div");
+    row.className = "sp-take";
+    const anc = (plan.anchors || {})[takeId];
+    row.innerHTML = `
+      <div class="sp-take-head">
+        <span class="sp-dot" style="background:${spColor(plan, takeId)}"></span>
+        <b>${spTakeName(takeId)}</b>
+        <span class="mono small muted">锚点 ${anc != null ? fmtTC(anc) : "未设(单击波形设置)"}</span>
+        <span class="spacer"></span>
+        <button data-sp-play="take" data-sp-arg="${takeId}" title="A 原录: 整版录音">A 原录</button>
+        <button class="sp-play-sel" data-take="${takeId}" title="B 候选: 试听当前选区" disabled>B 候选</button>
+        <button class="sp-add-seg" data-take="${takeId}" title="把当前选区追加到拼接轨" disabled>↓ 加入拼接轨</button>
+        <button class="sp-take-del" title="移除该录音及其拼接段">✕</button>
+      </div>
+      <canvas class="sp-take-canvas" data-take="${takeId}"></canvas>`;
+    takesDiv.appendChild(row);
+  }
+  box.appendChild(takesDiv);
+  // 添加录音
+  const addRow = document.createElement("div");
+  addRow.className = "sp-add-row";
+  const avail = S.narrations.filter(n => !(plan.takes || []).map(String).includes(String(n.id)));
+  addRow.innerHTML = avail.length
+    ? `<label class="small">挂接录音 <select class="sp-add-sel">${avail.map(n =>
+        `<option value="${n.id}">${n.name} (${n.duration.toFixed(2)}s)</option>`).join("")}</select></label>
+       <button class="sp-add-take">+ 挂接到本卡</button>`
+    : `<span class="muted small">项目旁白已全部挂接; 可在左栏继续上传 PCM WAV</span>`;
+  box.appendChild(addRow);
+
+  // ---- 拼接轨
+  const lays = spLayout(plan);
+  const compDur = lays.length ? lays[lays.length - 1].end : 0;
+  const trackHead = document.createElement("div");
+  trackHead.className = "sp-track-head";
+  trackHead.innerHTML = `
+    <b>拼接轨</b>
+    <span class="mono small muted">${lays.length} 段 · 合成 ${compDur.toFixed(3)}s${resolved ? " · 已确认生效" : ""}</span>
+    <span class="spacer"></span>
+    <button data-sp-play="comp" title="C 合成: 试听拼接结果" ${lays.length ? "" : "disabled"}>C 合成</button>
+    <button class="sp-stop">■ 停止</button>`;
+  box.appendChild(trackHead);
+  const trackCanvas = document.createElement("canvas");
+  trackCanvas.className = "sp-track-canvas";
+  box.appendChild(trackCanvas);
+
+  // ---- 段列表
+  const segBox = document.createElement("div");
+  segBox.className = "sp-segs";
+  lays.forEach((L, k) => {
+    const sg = L.sg;
+    const row = document.createElement("div");
+    row.className = "sp-seg";
+    row.innerHTML = `
+      <span class="sp-seg-no" style="background:${spColor(plan, sg.take_id)}">${k + 1}</span>
+      <span class="sp-seg-name">${spTakeName(sg.take_id)}</span>
+      <span class="mono small">${fmtTC(+sg.in || 0)}–${fmtTC(+sg.out || 0)}</span>
+      ${k > 0 ? `<label class="small">淡化 <input type="number" class="sp-xf mono" step="0.01" min="0" max="2" value="${(+sg.xfade || 0).toFixed(2)}">s</label>
+      <label class="small">间隔 <input type="number" class="sp-gap mono" step="0.01" min="0" max="2" value="${(+sg.gap || 0).toFixed(2)}">s</label>` : `<span class="small muted">首段</span>`}
+      <span class="mono small muted">→${fmtTC(L.start)}</span>
+      <button data-sp-play="seg" data-sp-arg="${k}" title="试听本段">▶</button>
+      <button class="sp-up" ${k === 0 ? "disabled" : ""}>↑</button>
+      <button class="sp-down" ${k === lays.length - 1 ? "disabled" : ""}>↓</button>
+      <button class="sp-del">✕</button>`;
+    segBox.appendChild(row);
+  });
+  box.appendChild(segBox);
+
+  // ---- 校审报告
+  const repDiv = document.createElement("div");
+  repDiv.className = "sp-report";
+  if (rep) {
+    const bads = rep.errors.filter(e => e.sev === "bad");
+    const warns = rep.errors.filter(e => e.sev === "warn");
+    repDiv.innerHTML = `
+      <div class="sp-rep-sum small">
+        合成 <b>${rep.duration.toFixed(3)}s</b> @ ${fmtTC(rep.start)} · 接缝 ${rep.seams.length} 个
+        ${rep.seams.map((s, i) => `<span class="mono">接缝${i + 1}@${fmtTC(rep.start + s.t)} 峰 ${s.peak_db.toFixed(1)}dB</span>`).join(" · ")}
+      </div>
+      ${[...bads, ...warns].map(e =>
+        `<div class="lv-err ${e.sev === "bad" ? "bad" : "warn"}">${e.sev === "bad" ? "⛔ " : "⚠ "}${e.msg}</div>`).join("")}
+      ${!bads.length && !warns.length ? `<div class="small ok">✓ 校审通过,可确认</div>` : ""}`;
+  } else {
+    repDiv.innerHTML = `<div class="muted small">编辑后自动校审: 采样格式/片段重叠/零交叉/接缝峰值/静音缺口/成片时长/锚点顺序/压住对白关键声</div>`;
+  }
+  box.appendChild(repDiv);
+
+  // ---- 确认区
+  const bads = rep ? rep.errors.filter(e => e.sev === "bad") : [];
+  const cf = document.createElement("div");
+  cf.className = "sp-confirm";
+  cf.innerHTML = `
+    <span class="badge ${plan.status === "confirmed" && resolved ? "ok" : (bads.length ? "bad" : "warn")}">
+      ${plan.status === "confirmed" && resolved ? "已确认(合成进入配平/混音/导出)"
+        : bads.length ? `待处理 · ${bads.length} 个阻塞` : "待处理"}</span>
+    <input id="spReason" class="grow" placeholder="采用理由(确认时写入修订; 阻塞时仅留痕不改状态)"
+           value="${plan.accepted_reason || ""}">
+    <button class="sp-confirm-btn" ${(plan.segments || []).length ? "" : "disabled"}>
+      ${plan.status === "confirmed" ? "重新确认" : "确认拼接"}</button>
+    <button class="sp-remove" title="拆除拼接方案,回退到整段绑定">拆除方案</button>`;
+  box.appendChild(cf);
+
+  // ---- 事件: 挂接/移除录音
+  const addSel = addRow.querySelector(".sp-add-sel");
+  const addBtn = addRow.querySelector(".sp-add-take");
+  if (addBtn) addBtn.addEventListener("click", () => {
+    const tid = addSel.value;
+    if (!tid) return;
+    pushUndo();
+    const pl = spPlan(did);
+    pl.takes.push(isNaN(+tid) ? tid : +tid);
+    spTouch(did); renderSplice();
+  });
+  takesDiv.querySelectorAll(".sp-take-del").forEach(btn =>
+    btn.addEventListener("click", () => {
+      const takeId = btn.closest(".sp-take").querySelector(".sp-take-canvas").dataset.take;
+      pushUndo();
+      const pl = spPlan(did);
+      pl.takes = (pl.takes || []).filter(t => String(t) !== String(takeId));
+      if (pl.anchors) delete pl.anchors[takeId];
+      pl.segments = (pl.segments || []).filter(sg => String(sg.take_id) !== String(takeId));
+      if (spEd.sel && String(spEd.sel.takeId) === String(takeId)) spEd.sel = null;
+      spTouch(did); renderSplice();
+    }));
+  // ---- 事件: take 波形(加载/绘制/交互)
+  takesDiv.querySelectorAll(".sp-take-canvas").forEach(cv => {
+    const takeId = cv.dataset.take;
+    drawSpTake(cv, did, takeId);
+    spEnsureBuf(takeId).then(() => {
+      if (cv.isConnected) drawSpTake(cv, did, takeId);
+    });
+    cv.addEventListener("mousedown", (e) => {
+      const pk = spPeaks[takeId];
+      if (!pk) return;
+      spEd.drag = { takeId, canvas: cv, a0: spTakePos(e, cv, pk.duration), moved: false };
+      e.preventDefault();
+    });
+  });
+  takesDiv.querySelectorAll("[data-sp-play='take']").forEach(btn =>
+    btn.addEventListener("click", () => spPlay("take", btn.dataset.spArg)));
+  takesDiv.querySelectorAll(".sp-play-sel").forEach(btn =>
+    btn.addEventListener("click", () => spPlay("sel")));
+  takesDiv.querySelectorAll(".sp-add-seg").forEach(btn =>
+    btn.addEventListener("click", () => {
+      if (!spEd.sel || String(spEd.sel.takeId) !== String(btn.dataset.take)) return;
+      pushUndo();
+      const pl = spPlan(did);
+      pl.segments = pl.segments || [];
+      pl.segments.push({ take_id: isNaN(+spEd.sel.takeId) ? spEd.sel.takeId : +spEd.sel.takeId,
+                         in: +spEd.sel.a.toFixed(3), out: +spEd.sel.b.toFixed(3),
+                         xfade: pl.segments.length ? 0.03 : 0, gap: 0 });
+      spEd.sel = null;
+      spTouch(did); renderSplice();
+    }));
+  // ---- 事件: 拼接轨/段
+  trackHead.querySelector("[data-sp-play='comp']").addEventListener("click", () => spPlay("comp"));
+  trackHead.querySelector(".sp-stop").addEventListener("click", spStop);
+  segBox.querySelectorAll(".sp-seg").forEach((row, k) => {
+    row.querySelector("[data-sp-play='seg']").addEventListener("click", () => spPlay("seg", k));
+    const xf = row.querySelector(".sp-xf");
+    if (xf) xf.addEventListener("change", () => {
+      pushUndo();
+      plan.segments[k].xfade = Math.max(0, +xf.value || 0);
+      spTouch(did); renderSplice();
+    });
+    const gp = row.querySelector(".sp-gap");
+    if (gp) gp.addEventListener("change", () => {
+      pushUndo();
+      plan.segments[k].gap = Math.max(0, +gp.value || 0);
+      spTouch(did); renderSplice();
+    });
+    row.querySelector(".sp-up").addEventListener("click", () => {
+      if (k === 0) return;
+      pushUndo();
+      [plan.segments[k - 1], plan.segments[k]] = [plan.segments[k], plan.segments[k - 1]];
+      spTouch(did); renderSplice();
+    });
+    row.querySelector(".sp-down").addEventListener("click", () => {
+      if (k >= plan.segments.length - 1) return;
+      pushUndo();
+      [plan.segments[k], plan.segments[k + 1]] = [plan.segments[k + 1], plan.segments[k]];
+      spTouch(did); renderSplice();
+    });
+    row.querySelector(".sp-del").addEventListener("click", () => {
+      pushUndo();
+      plan.segments.splice(k, 1);
+      spTouch(did); renderSplice();
+    });
+  });
+  // ---- 事件: 确认/拆除
+  cf.querySelector(".sp-confirm-btn").addEventListener("click", () => spliceConfirm(did));
+  cf.querySelector(".sp-remove").addEventListener("click", async () => {
+    pushUndo();
+    delete S.splice.items[did];
+    delete S.leveling.items[did];
+    spEd.sel = null;
+    await computeSplice();
+    toast(`已拆除 ${did} 拼接方案,回退到整段绑定`);
+  });
+
+  drawSpTrack(trackCanvas, did);
+  syncSpPlayButtons();
+  syncSpSelButtons();
+}
+
+// ---- take 波形绘制: 波形 + 已在轨段(蓝) + 候选选区(黄) + 锚点(绿)
+function spTakePos(e, canvas, dur) {
+  const r = canvas.getBoundingClientRect();
+  return Math.max(0, Math.min(dur, (e.clientX - r.left) / r.width * dur));
+}
+function drawSpTake(canvas, did, takeId) {
+  const plan = S.splice.items[did] || {};
+  const pk = spPeaks[takeId];
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || 600, h = 64;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const g = canvas.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.fillStyle = "#0d1015"; g.fillRect(0, 0, w, h);
+  if (!pk) {
+    g.fillStyle = "#7f8ca0"; g.font = "11px sans-serif";
+    g.fillText("载入中…", 8, h / 2);
+    return;
+  }
+  const dur = pk.duration;
+  const xOf = t => t / dur * w;
+  for (const sg of plan.segments || []) {
+    if (String(sg.take_id) !== String(takeId)) continue;
+    g.fillStyle = "rgba(77,163,255,.18)";
+    g.fillRect(xOf(+sg.in || 0), 0, xOf(+sg.out || 0) - xOf(+sg.in || 0), h);
+  }
+  if (spEd.sel && String(spEd.sel.takeId) === String(takeId)) {
+    g.fillStyle = "rgba(255,184,77,.28)";
+    g.fillRect(xOf(spEd.sel.a), 0, xOf(spEd.sel.b) - xOf(spEd.sel.a), h);
+  }
+  const n = pk.mins.length, mid = h / 2;
+  g.fillStyle = "#4da3ff";
+  for (let i = 0; i < n; i++) {
+    const x = i / n * w, x2 = (i + 1) / n * w;
+    const y1 = mid - pk.maxs[i] * (mid - 4), y2 = mid - pk.mins[i] * (mid - 4);
+    g.fillRect(x, y1, Math.max(1, x2 - x), Math.max(1, y2 - y1));
+  }
+  const anc = (plan.anchors || {})[takeId];
+  if (anc != null) {
+    const x = xOf(anc);
+    g.strokeStyle = "#5fd68a"; g.fillStyle = "#5fd68a";
+    g.beginPath(); g.moveTo(x, 0); g.lineTo(x, h); g.stroke();
+    g.beginPath(); g.moveTo(x - 4, 0); g.lineTo(x + 4, 0); g.lineTo(x, 6); g.fill();
+  }
+  g.fillStyle = "#5b6878"; g.font = "9px monospace";
+  const step = dur > 2.5 ? 1 : 0.5;
+  for (let t = 0; t <= dur + 1e-6; t += step) g.fillText(t.toFixed(1), xOf(t) + 2, h - 3);
+}
+
+// ---- 拼接轨绘制: 段块(按录音着色) + 交叉淡化区 + 接缝 + 锚点
+function drawSpTrack(canvas, did) {
+  const plan = S.splice.items[did] || {};
+  const lays = spLayout(plan);
+  const rep = S.spliceReport && S.spliceReport.items[did];
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || 600, h = 70;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const g = canvas.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.fillStyle = "#0d1015"; g.fillRect(0, 0, w, h);
+  const total = lays.length ? lays[lays.length - 1].end : 0;
+  if (!total) {
+    g.fillStyle = "#7f8ca0"; g.font = "11px sans-serif";
+    g.fillText("拼接轨为空:在上方候选录音波形上拖出选区,点「↓ 加入拼接轨」", 10, h / 2);
+    return;
+  }
+  const xOf = t => t / total * w;
+  lays.forEach((L, k) => {
+    const col = spColor(plan, L.sg.take_id);
+    const x0 = xOf(L.start), x1 = xOf(L.end);
+    g.fillStyle = col + "44";
+    g.fillRect(x0, 14, x1 - x0, h - 28);
+    g.strokeStyle = col;
+    g.strokeRect(x0 + 0.5, 14.5, x1 - x0 - 1, h - 29);
+    const xf = +L.sg.xfade || 0;
+    if (xf > 0) {
+      g.fillStyle = "rgba(255,255,255,.20)";
+      g.fillRect(x0, 14, xOf(L.start + xf) - x0, h - 28);
+    }
+    g.fillStyle = "#dbe2ec"; g.font = "10px sans-serif";
+    g.fillText(String(k + 1), x0 + 3, 24);
+  });
+  // 锚点(绿三角, 按段内偏移映射到合成时间)
+  for (const L of lays) {
+    const anc = (plan.anchors || {})[L.sg.take_id];
+    if (anc == null || anc < (+L.sg.in || 0) - 1e-6 || anc > (+L.sg.out || 0) + 1e-6) continue;
+    const x = xOf(L.start + (anc - (+L.sg.in || 0)));
+    g.fillStyle = "#5fd68a";
+    g.beginPath(); g.moveTo(x - 4, h - 14); g.lineTo(x + 4, h - 14); g.lineTo(x, h - 8); g.fill();
+  }
+  // 接缝线: 削波红 / 峰值超限黄 / 正常灰
+  if (rep) {
+    const ceil = S.splice.settings.seamCeilingDb;
+    for (const sm of rep.seams || []) {
+      const x = xOf(sm.t);
+      g.strokeStyle = sm.clip_frames > 0 ? "#ff6b6b"
+                    : sm.peak_db > ceil ? "#ffb84d" : "rgba(255,255,255,.35)";
+      g.beginPath(); g.moveTo(x, 10); g.lineTo(x, h - 14); g.stroke();
+    }
+  }
+  g.fillStyle = "#5b6878"; g.font = "9px monospace";
+  const step = total > 6 ? 1 : 0.5;
+  for (let t = 0; t <= total + 1e-6; t += step) g.fillText(t.toFixed(1), xOf(t) + 2, h - 3);
+}
+
+// ---- take 波形交互: 拖动=候选选区, 单击=设/移同步锚点
+window.addEventListener("mousemove", (e) => {
+  const dr = spEd.drag;
+  if (!dr) return;
+  const pk = spPeaks[dr.takeId];
+  if (!pk) return;
+  const t = spTakePos(e, dr.canvas, pk.duration);
+  if (Math.abs(t - dr.a0) * dr.canvas.clientWidth / pk.duration > 3) dr.moved = true;
+  if (dr.moved) {
+    spEd.sel = { takeId: dr.takeId, a: Math.min(dr.a0, t), b: Math.max(dr.a0, t) };
+    drawSpTake(dr.canvas, spEd.did, dr.takeId);
+    syncSpSelButtons();
+  }
+});
+window.addEventListener("mouseup", (e) => {
+  const dr = spEd.drag;
+  if (!dr) return;
+  spEd.drag = null;
+  const pk = spPeaks[dr.takeId];
+  if (!dr.moved && pk && spEd.did) {
+    const plan = spPlan(spEd.did);   // 单击设锚是编辑操作: 无方案则创建
+    pushUndo();
+    plan.anchors = plan.anchors || {};
+    plan.anchors[dr.takeId] = +spTakePos(e, dr.canvas, pk.duration).toFixed(3);
+    spTouch(spEd.did);
+  } else if (dr.moved) {
+    drawSpTake(dr.canvas, spEd.did, dr.takeId);
+    syncSpSelButtons();
+  }
+});
+function syncSpSelButtons() {
+  document.querySelectorAll("#spliceEditor .sp-add-seg, #spliceEditor .sp-play-sel").forEach(btn => {
+    btn.disabled = !(spEd.sel && String(spEd.sel.takeId) === String(btn.dataset.take));
+  });
+}
+
+// ---- 确认拼接
+async function spliceConfirm(did) {
+  const reasonInp = $("spReason");
+  const reason = reasonInp ? reasonInp.value.trim() : "";
+  try {
+    await computeSplice();   // 先保存最新方案(后端对变更内容强制重新确认)
+    const r = await api(`/api/project/${S.projectId}/spliceconfirm`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ desc_id: did, accepted_reason: reason }),
+    });
+    const st = await api(`/api/project/${S.projectId}/state`);
+    S.splice.items = (st.splice || {}).items || {};
+    S.leveling.items = (st.leveling || {}).items || {};
+    S.spliceReport = r.report;
+    S.spliceResolved = r.resolved || {};
+    renderRevisions(st.revisions);
+    renderSplice(); renderDescList(); renderLeveling(); runChecks();
+    AudioEngine.invalidateMix(); draw();
+    if (r.confirmed && r.confirmed.includes(did)) {
+      toast(`已确认拼接 ${did},合成片段进入配平/混音/导出`);
+    } else {
+      const b = (r.blocked || [])[0];
+      toast(`${did} 阻塞待处理,保持 pending${b && b.reasonLogged ? ",理由已留痕但不改变状态" : ""}${b ? ":" + b.codes.join(",") : ""}`);
+    }
+  } catch (e) { toast(e.message); }
+}
+
+// ---- 拼接参数与描述卡切换
+[["spZerox", "zeroxMs"], ["spGap", "gapWarnS"], ["spCeil", "seamCeilingDb"]]
+.forEach(([id, key]) => $(id).addEventListener("change", () => {
+  S.splice.settings[key] = +$(id).value;
+  scheduleSplice();
+}));
+$("spliceDesc").addEventListener("change", () => {
+  spEd.did = $("spliceDesc").value;
+  spEd.sel = null;
+  renderSplice();
+});
+
 // ---------------------------------------------------------------- 播放引擎(Web Audio)
 const AudioEngine = {
-  ctx: null, srcBuf: null, narrBufs: {}, mixBuf: null, nodes: [], playing: false,
-  reset() { this.stop(); this.srcBuf = null; this.narrBufs = {}; this.mixBuf = null; },
-  invalidateMix() { this.mixBuf = null; },
+  ctx: null, srcBuf: null, narrBufs: {}, mixBuf: null, spliceBufs: {}, nodes: [], playing: false,
+  reset() { this.stop(); this.srcBuf = null; this.narrBufs = {}; this.mixBuf = null; this.spliceBufs = {}; },
+  invalidateMix() { this.mixBuf = null; this.spliceBufs = {}; },
   ensureCtx() { if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)(); return this.ctx; },
   async decode(url) {
     const ctx = this.ensureCtx();
@@ -1143,8 +1749,10 @@ const AudioEngine = {
   },
   // 旁白有效片段(缩写则压缩); 带缓存, placements 变化时 invalidateMix 清掉
   async effectiveNarr(d) {
-    const p = S.placements[d.id];
-    let nb = await this.loadNarr(p.narration_id);
+    // 确认版拼接: 用前端合成的拼接片段(与服务端 render_splice 同算法)
+    let nb = S.spliceResolved[d.id]
+      ? await buildSpliceBuffer(d.id)
+      : await this.loadNarr(S.placements[d.id].narration_id);
     const f = abridgeFactor(d);
     if (f !== 1) nb = this.resampleBuffer(nb, f);
     return nb;
@@ -1161,7 +1769,7 @@ const AudioEngine = {
     const jobs = [];
     for (const d of S.descriptions) {
       const p = S.placements[d.id];
-      if (!p || !p.narration_id) continue;
+      if (!p || (!p.narration_id && !S.spliceResolved[d.id])) continue;
       jobs.push({ p, _did: d.id, nb: await this.effectiveNarr(d) });
     }
     const env = new Float32Array(n).fill(1);
